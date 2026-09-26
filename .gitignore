@@ -1,0 +1,9 @@
+build/
+*.exe
+*.pdb
+*.ilk
+*.obj
+
+# 本地实际使用的数据文件不入库（仓库里给的是 *.sample.json）
+dictation_extra.json
+dictation_judge.json

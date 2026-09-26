@@ -1,0 +1,5 @@
+* text=auto
+*.bat text eol=crlf
+*.c text eol=lf
+*.lua text eol=lf
+*.png binary

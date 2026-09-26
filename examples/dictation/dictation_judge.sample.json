@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "host": "127.0.0.1",
+  "port": 8087,
+  "threshold": 0.9,
+  "timeout_s": 15,
+  "exe": "jev/llama/llama-server.exe",
+  "model": "jev/Jev-Style-0.8B-Decision-v3-Q4_K_M.gguf"
+}
