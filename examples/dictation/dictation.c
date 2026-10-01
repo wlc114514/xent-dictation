@@ -46,6 +46,12 @@ enum {
 	MSG_MODE,
 	MSG_ANSWER,
 	MSG_START_ROUND,
+	MSG_ADD,
+	MSG_ADD_LINE,
+	MSG_ADD_ONE,
+	MSG_ADD_CLIP,
+	MSG_ADD_CLEAR,
+	MSG_ADD_BACK,
 };
 
 typedef enum Phase {
@@ -55,6 +61,7 @@ typedef enum Phase {
 	PH_REVEALED,
 	PH_DONE,
 	PH_PREVIEW,
+	PH_ADD,
 } Phase;
 
 typedef struct Word {
@@ -112,6 +119,13 @@ typedef struct Dict {
 
 	/* 数据文件解析出来的根目录（用于相对路径回退） */
 	char root[MAX_PATH];
+
+	/* 加词页 */
+	char     add_line[DICT_MAX_ANSWER];
+	char     add_msg[512];
+	XtkColor add_msg_color;
+	int      clear_arm;   /* 清空要二次确认 */
+	Phase    add_prev;    /* 从哪个页面进来的 */
 } Dict;
 
 static Dict g_app;
@@ -606,6 +620,320 @@ static void json_escape(const char *src, char *dst, size_t cap)
 	dst[j] = 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* 加词：辅助（规则与 Python 版 AddWordsDialog 一致）                    */
+/* ------------------------------------------------------------------ */
+
+static bool has_cjk(const char *s)
+{
+	uint32_t dummy;
+	return utf8_cjk(s, &dummy, 1) > 0;
+}
+
+/* 中文标点（Python 版会去掉它们前面的空格） */
+static bool is_cjk_punct(const char *s)
+{
+	static const char *const P[] = {"，", "。", "；", "：", "、", "（", "】", NULL};
+	for (int i = 0; P[i]; i++) {
+		size_t L = strlen(P[i]);
+		if (strncmp(s, P[i], L) == 0) return true;
+	}
+	return false;
+}
+
+/* 词性标记表（与 Python 版 _POS_RE 同集合；长的在前，避免短词先命中） */
+static const char *const POS_TOKENS[] = {
+	"prep&adv", "n&adj", "adj&n", "n&v", "v&n", "adj&adv", "adj&v",
+	"conj", "adj", "adv", "prep", "n", "v", NULL
+};
+static const char *const POS_BARE[] = {"n", "v", "adj", "adv", "prep", "conj", NULL};
+
+/* 在 s（整串起点 begin）处试配一个词性标记；返回消耗字节数，token 写入 tok */
+static int pos_try(const char *s, const char *begin, char *tok, size_t cap)
+{
+	for (int i = 0; POS_TOKENS[i]; i++) {
+		size_t L = strlen(POS_TOKENS[i]);
+		if (strncmp(s, POS_TOKENS[i], L) != 0) continue;
+		if (isalnum((unsigned char)s[L])) continue;                 /* \b 右侧 */
+		if (s > begin && isalnum((unsigned char)s[-1])) continue;    /* \b 左侧 */
+		const char *p = s + L;
+		while (*p == ' ') p++;
+		char tmp[40];
+		snprintf(tmp, sizeof tmp, "%s", POS_TOKENS[i]);
+		if (*p == '.') {
+			p++;
+			if (strlen(tmp) + 2 < sizeof tmp) strcat(tmp, ".");
+		} else {
+			for (int k = 0; POS_BARE[k]; k++) {                     /* 裸词补点，与 Python 一致 */
+				if (strcmp(tmp, POS_BARE[k]) == 0) { strcat(tmp, "."); break; }
+			}
+		}
+		snprintf(tok, cap, "%s", tmp);
+		return (int)(p - s);
+	}
+	return 0;
+}
+
+/* "n. 过程 v. 处理" → pos="n. v."、meaning="过程 处理" */
+static void split_pos_meaning(const char *rest, char *pos, size_t pc, char *meaning, size_t mc)
+{
+	char toks[8][40];
+	int  nt = 0;
+	pos[0] = meaning[0] = 0;
+	if (!rest) return;
+
+	char tmp[4096];
+	size_t tj = 0;
+	const char *p = rest;
+	while (*p && tj + 8 < sizeof tmp) {
+		char tok[40];
+		int used = pos_try(p, rest, tok, sizeof tok);
+		if (used > 0) {
+			bool dup = false;
+			for (int i = 0; i < nt; i++) if (strcmp(toks[i], tok) == 0) dup = true;
+			if (!dup && nt < 8) snprintf(toks[nt++], sizeof toks[0], "%s", tok);
+			p += used;
+			continue;
+		}
+		if (*p == '&') { tmp[tj++] = ' '; p++; continue; }   /* Python: & → 空格 */
+		uint32_t cp;
+		int n = utf8_decode((const unsigned char *)p, &cp);
+		if (n <= 0) n = 1;
+		if (tj + (size_t)n + 1 < sizeof tmp) { memcpy(tmp + tj, p, (size_t)n); tj += (size_t)n; }
+		p += n;
+	}
+	tmp[tj] = 0;
+
+	/* 压空白、去首尾、去掉中文标点前的空格 */
+	size_t oj = 0;
+	bool   pending_sp = false;
+	for (const char *q = tmp; *q; ) {
+		if (*q == ' ' || *q == '\t') { if (oj > 0) pending_sp = true; q++; continue; }
+		uint32_t cp;
+		int n = utf8_decode((const unsigned char *)q, &cp);
+		if (n <= 0) n = 1;
+		if (pending_sp && !is_cjk_punct(q) && oj + (size_t)n + 2 < mc) meaning[oj++] = ' ';
+		pending_sp = false;
+		if (oj + (size_t)n + 1 < mc) { memcpy(meaning + oj, q, (size_t)n); oj += (size_t)n; }
+		q += n;
+	}
+	meaning[oj] = 0;
+
+	/* 词性：去重后以空格连接 */
+	for (int i = 0; i < nt; i++) {
+		size_t have = strlen(pos);
+		if (i && have + 1 < pc) { pos[have] = ' '; pos[have + 1] = 0; have++; }
+		if (have + strlen(toks[i]) < pc) strcat(pos, toks[i]);
+	}
+}
+
+/* 取行首的「单词」，返回其余部分（没有词/没有其余部分 → NULL） */
+static const char *split_first_word(const char *line, char *word, size_t wc)
+{
+	const char *p = line;
+	while (*p == ' ' || *p == '\t') p++;
+	if (!*p) return NULL;
+	const char *e = p;
+	while (*e && *e != ' ' && *e != '\t') e++;
+	size_t len = (size_t)(e - p);
+	if (len + 1 > wc) len = wc - 1;
+	memcpy(word, p, len);
+	word[len] = 0;
+	while (*e == ' ' || *e == '\t') e++;
+	return (*e && word[0]) ? e : NULL;
+}
+
+static bool word_exists(const Dict *d, const char *w)
+{
+	for (int i = 0; i < d->nwords; i++) if (str_ci_eq(d->words[i].word, w)) return true;
+	return false;
+}
+
+static bool item_dup(const Word *items, int n, const char *w)
+{
+	for (int i = 0; i < n; i++) if (str_ci_eq(items[i].word, w)) return true;
+	return false;
+}
+
+static void put_item(Word *it, const char *w, const char *pos, const char *mn)
+{
+	snprintf(it->word, sizeof it->word, "%s", w ? w : "");
+	snprintf(it->pos, sizeof it->pos, "%s", pos ? pos : "");
+	snprintf(it->meaning, sizeof it->meaning, "%s", mn ? mn : "");
+}
+
+/* 顶层数组的收尾 ']'（带字符串语义，词义里出现 ']' 也不会认错） */
+static char *top_level_end(char *buf)
+{
+	int  depth = 0;
+	bool in_str = false, esc = false;
+	for (char *p = buf; *p; p++) {
+		char c = *p;
+		if (in_str) {
+			if (esc) esc = false;
+			else if (c == '\\') esc = true;
+			else if (c == '"') in_str = false;
+			continue;
+		}
+		if (c == '"') in_str = true;
+		else if (c == '[') depth++;
+		else if (c == ']') { if (--depth <= 0) return p; }
+	}
+	return NULL;
+}
+
+/* 把新词追加进词表文件：保留文件原有内容，只往顶层数组末尾插 */
+static bool append_words_to_file(const char *path, const Word *items, int n)
+{
+	if (n <= 0) return true;
+	char *buf = read_file(path, NULL);
+	char *end = buf ? top_level_end(buf) : NULL;
+	FILE *f = fopen(path, "wb");
+	if (!f) { free(buf); return false; }
+	fputs("[\n", f);
+	if (buf && end) {
+		*end = 0;
+		size_t len = strlen(buf);
+		while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
+		                   buf[len - 1] == ' '  || buf[len - 1] == '\t')) buf[--len] = 0;
+		if (len > 1) {                        /* buf[0] 是 '['，跳过它 */
+			fwrite(buf + 1, 1, len - 1, f);
+			fputs(",\n", f);
+		}
+	}
+	for (int i = 0; i < n; i++) {
+		char w[DICT_MAX_WORD * 7], ps[DICT_MAX_POS * 7], mn[DICT_MAX_MEANING * 7];
+		json_escape(items[i].word, w, sizeof w);
+		json_escape(items[i].pos, ps, sizeof ps);
+		json_escape(items[i].meaning, mn, sizeof mn);
+		fprintf(f, "  [\"%s\", \"%s\", \"%s\"]%s\n", w, ps, mn, (i + 1 < n) ? "," : "");
+	}
+	fputs("]\n", f);
+	fclose(f);
+	free(buf);
+	return true;
+}
+
+/* 剪贴板文本 → UTF-8（调用方 free） */
+static char *clipboard_text(void)
+{
+	if (!OpenClipboard(NULL)) return NULL;
+	char *out = NULL;
+	HANDLE h = GetClipboardData(CF_UNICODETEXT);
+	if (h) {
+		const wchar_t *wt = (const wchar_t *)GlobalLock(h);
+		if (wt) {
+			int need = WideCharToMultiByte(CP_UTF8, 0, wt, -1, NULL, 0, NULL, NULL);
+			if (need > 0 && need < 4 * 1024 * 1024) {
+				out = (char *)malloc((size_t)need + 1);
+				if (out) WideCharToMultiByte(CP_UTF8, 0, wt, -1, out, need, NULL, NULL);
+			}
+			GlobalUnlock(h);
+		}
+	}
+	CloseClipboard();
+	return out;
+}
+
+typedef struct AddStat {
+	int  added, dup, bad;
+	char err[200];
+} AddStat;
+
+/* 多行文本 → 追加进词表。两种格式：
+ *   ① 两段式：先全部英文单词（一行一个），再全部中文释义（一行一个），数量要一致
+ *   ② 单行式：每行「单词 词性 释义」
+ * 重复的自动跳过（与 Python 版 save() 同规则）。 */
+static void add_from_text(Dict *m, const char *text, AddStat *st)
+{
+	st->added = st->dup = st->bad = 0;
+	st->err[0] = 0;
+	size_t len = strlen(text);
+	if (len == 0) { snprintf(st->err, sizeof st->err, "没有内容"); return; }
+
+	int    maxl  = (int)(len / 2 + 4);
+	char  *buf   = (char *)malloc(len + 1);
+	char **lines = (char **)malloc(sizeof(char *) * (size_t)maxl);
+	bool  *cjk   = (bool *)malloc(sizeof(bool) * (size_t)maxl);
+	Word  *items = (Word *)calloc((size_t)maxl, sizeof(Word));
+	if (!buf || !lines || !cjk || !items) {
+		snprintf(st->err, sizeof st->err, "内存不足");
+		free(buf); free(lines); free(cjk); free(items);
+		return;
+	}
+	memcpy(buf, text, len + 1);
+
+	int   cap = 0;
+	char *p = buf;
+	while (*p && cap < maxl) {
+		char *e = p;
+		while (*e && *e != '\n' && *e != '\r') e++;
+		char save = *e;
+		*e = 0;
+		while (*p == ' ' || *p == '\t') p++;
+		char *q = p + strlen(p);
+		while (q > p && (q[-1] == ' ' || q[-1] == '\t')) *--q = 0;
+		if (*p) lines[cap++] = p;
+		if (!save) break;
+		e++;
+		if (save == '\r' && *e == '\n') e++;
+		p = e;
+	}
+	if (cap == 0) { snprintf(st->err, sizeof st->err, "没有可读的行"); goto done; }
+
+	int  first_cjk = -1;
+	bool any_ascii = false;
+	for (int i = 0; i < cap; i++) {
+		cjk[i] = has_cjk(lines[i]);
+		if (cjk[i] && first_cjk < 0) first_cjk = i;
+		if (!cjk[i]) any_ascii = true;
+	}
+
+	int ni = 0;
+	if (any_ascii) {
+		/* 两段式 */
+		int  eng_n = (first_cjk < 0) ? cap : first_cjk;
+		int  zh_n  = cap - eng_n;
+		bool mixed = false;
+		for (int i = eng_n; i < cap; i++) if (!cjk[i]) mixed = true;
+		if (mixed) snprintf(st->err, sizeof st->err, "格式混杂：英文行和中文行交错，请检查后重试");
+		else if (eng_n != zh_n) snprintf(st->err, sizeof st->err, "英文 %d 个、中文 %d 行，数量不一致", eng_n, zh_n);
+		else {
+			for (int i = 0; i < eng_n && ni < maxl; i++) {
+				char pos[DICT_MAX_POS] = {0}, mn[DICT_MAX_MEANING] = {0};
+				split_pos_meaning(lines[eng_n + i], pos, sizeof pos, mn, sizeof mn);
+				if (!mn[0]) { st->bad++; continue; }
+				if (word_exists(m, lines[i]) || item_dup(items, ni, lines[i])) { st->dup++; continue; }
+				put_item(&items[ni++], lines[i], pos, mn);
+			}
+		}
+	} else {
+		/* 每行一条 */
+		for (int i = 0; i < cap && ni < maxl; i++) {
+			char w[DICT_MAX_WORD] = {0}, pos[DICT_MAX_POS] = {0}, mn[DICT_MAX_MEANING] = {0};
+			const char *rest = split_first_word(lines[i], w, sizeof w);
+			if (!w[0] || !rest) { st->bad++; continue; }
+			split_pos_meaning(rest, pos, sizeof pos, mn, sizeof mn);
+			if (!mn[0]) { st->bad++; continue; }
+			if (word_exists(m, w) || item_dup(items, ni, w)) { st->dup++; continue; }
+			put_item(&items[ni++], w, pos, mn);
+		}
+	}
+
+	if (st->err[0] || ni == 0) goto done;
+	if (m->nwords + ni > DICT_MAX_WORDS) ni = DICT_MAX_WORDS - m->nwords;
+	if (ni <= 0) { snprintf(st->err, sizeof st->err, "词表已满（上限 %d 词）", DICT_MAX_WORDS); goto done; }
+	if (!append_words_to_file(m->root, items, ni)) {
+		snprintf(st->err, sizeof st->err, "写入词表失败：%s", m->root);
+		goto done;
+	}
+	for (int i = 0; i < ni; i++) m->words[m->nwords++] = items[i];
+	st->added = ni;
+
+done:
+	free(buf); free(lines); free(cjk); free(items);
+}
+
 /* 从 /completion 响应里取 " yes"/" no" 的 logprob */
 static bool parse_yesno(const char *resp, double *yes, double *no)
 {
@@ -862,6 +1190,110 @@ static void do_toggle_mode(Dict *m)
 	clear_result(m);
 }
 
+/* ------------------------------------------------------------------ */
+/* 加词页动作                                                          */
+/* ------------------------------------------------------------------ */
+static void do_open_add(Dict *m)
+{
+	if (m->phase != PH_ADD) m->add_prev = m->phase;
+	m->phase = PH_ADD;
+	m->add_msg[0] = 0;
+	m->add_line[0] = 0;
+	m->clear_arm = 0;
+}
+
+static void do_add_back(Dict *m)
+{
+	m->clear_arm = 0;
+	m->phase = (m->add_prev == PH_ADD) ? PH_NORMAL : m->add_prev;
+}
+
+static void do_add_one(Dict *m)
+{
+	if (is_blank(m->add_line)) {
+		snprintf(m->add_msg, sizeof m->add_msg, "先在输入框里写：单词 词性 释义（如 fossil n. 化石）");
+		m->add_msg_color = COL_RED;
+		return;
+	}
+	char w[DICT_MAX_WORD] = {0}, pos[DICT_MAX_POS] = {0}, mn[DICT_MAX_MEANING] = {0};
+	const char *rest = split_first_word(m->add_line, w, sizeof w);
+	if (!w[0] || !rest) {
+		snprintf(m->add_msg, sizeof m->add_msg, "没读懂：格式是「单词 词性 释义」，如 fossil n. 化石");
+		m->add_msg_color = COL_RED;
+		return;
+	}
+	split_pos_meaning(rest, pos, sizeof pos, mn, sizeof mn);
+	if (!mn[0]) {
+		snprintf(m->add_msg, sizeof m->add_msg, "没读出释义：格式是「单词 词性 释义」，如 fossil n. 化石");
+		m->add_msg_color = COL_RED;
+		return;
+	}
+	if (word_exists(m, w)) {
+		snprintf(m->add_msg, sizeof m->add_msg, "「%s」已经在词表里了（重复的会自动跳过）", w);
+		m->add_msg_color = COL_RED;
+		return;
+	}
+	if (m->nwords >= DICT_MAX_WORDS) {
+		snprintf(m->add_msg, sizeof m->add_msg, "词表已满（上限 %d 词）", DICT_MAX_WORDS);
+		m->add_msg_color = COL_RED;
+		return;
+	}
+	Word it;
+	put_item(&it, w, pos, mn);
+	if (!append_words_to_file(m->root, &it, 1)) {
+		snprintf(m->add_msg, sizeof m->add_msg, "写入词表失败：%s", m->root);
+		m->add_msg_color = COL_RED;
+		return;
+	}
+	m->words[m->nwords++] = it;
+	snprintf(m->add_msg, sizeof m->add_msg, "已录入「%s %s %s」（当前 %d 个词），点「重新开始」即可默写新词",
+	         it.word, it.pos, it.meaning, m->nwords);
+	m->add_msg_color = COL_GREEN;
+	m->add_line[0] = 0;
+}
+
+static void do_add_clip(Dict *m)
+{
+	char *t = clipboard_text();
+	if (!t || !*t) {
+		snprintf(m->add_msg, sizeof m->add_msg, "剪贴板里没有文字（先在别处复制好词表再来）");
+		m->add_msg_color = COL_RED;
+		free(t);
+		return;
+	}
+	AddStat st;
+	add_from_text(m, t, &st);
+	free(t);
+	if (st.err[0]) {
+		snprintf(m->add_msg, sizeof m->add_msg, "%s", st.err);
+		m->add_msg_color = COL_RED;
+	} else if (st.added <= 0) {
+		snprintf(m->add_msg, sizeof m->add_msg, "没有可录入的词：%d 行重复、%d 行格式不对", st.dup, st.bad);
+		m->add_msg_color = COL_RED;
+	} else {
+		if (st.dup + st.bad > 0)
+			snprintf(m->add_msg, sizeof m->add_msg, "已录入 %d 个词，跳过 %d 行（重复或格式不对）。点「重新开始」即可默写新词", st.added, st.dup + st.bad);
+		else
+			snprintf(m->add_msg, sizeof m->add_msg, "已录入 %d 个词（当前 %d 个词）。点「重新开始」即可默写新词", st.added, m->nwords);
+		m->add_msg_color = COL_GREEN;
+	}
+}
+
+static void do_add_clear(Dict *m)
+{
+	if (!m->clear_arm) {
+		m->clear_arm = 1;
+		snprintf(m->add_msg, sizeof m->add_msg, "再点一次「清空全部词」确认：会删掉 %d 个词并删除 %s", m->nwords, m->root);
+		m->add_msg_color = COL_RED;
+		return;
+	}
+	m->clear_arm = 0;
+	if (m->root[0]) remove(m->root);
+	m->nwords = 0;
+	snprintf(m->add_msg, sizeof m->add_msg, "已清空全部词。重新录入后点「重新开始」开始默写");
+	m->add_msg_color = COL_GREEN;
+}
+
 static void update(void *model, XtkMsg msg)
 {
 	Dict *m = (Dict *)model;
@@ -875,6 +1307,15 @@ static void update(void *model, XtkMsg msg)
 	case MSG_RESTART:     do_restart(m);     break;
 	case MSG_MODE:        do_toggle_mode(m); break;
 	case MSG_START_ROUND: start_round(m);    break;
+	case MSG_ADD:         do_open_add(m);    break;
+	case MSG_ADD_BACK:    do_add_back(m);    break;
+	case MSG_ADD_LINE:
+		if (msg.ptr) snprintf(m->add_line, sizeof m->add_line, "%s", (const char *)msg.ptr);
+		m->clear_arm = 0;
+		break;
+	case MSG_ADD_ONE:     do_add_one(m);     break;
+	case MSG_ADD_CLIP:    do_add_clip(m);    break;
+	case MSG_ADD_CLEAR:   do_add_clear(m);   break;
 	default: break;
 	}
 }
@@ -886,6 +1327,44 @@ static void update(void *model, XtkMsg msg)
 static XtkEl *view_impl(XtkUi *ui, void *model)
 {
 	Dict *m = (Dict *)model;
+
+	if (m->phase == PH_ADD) {
+		/* —— 加词页 —— */
+		return xtk_grow(xtk_column(ui, (XtkStackDesc){.align = XENT_FLEX_ALIGN_STRETCH, .fill = true},
+		    xtk_kids(
+		        xtk_titlebar(ui, "单词默写", (XtkTitleBarDesc){.subtitle = "加词", .integrate_window = true}),
+		        xtk_grow(xtk_column(ui, (XtkStackDesc){.padding = {28, 18, 28, 18}, .justify = XENT_FLEX_JUSTIFY_CENTER, .align = XENT_FLEX_ALIGN_STRETCH, .fill = true},
+		            xtk_kids(
+		                xtk_card(ui, (XtkStackDesc){.gap = 14, .padding = {36, 32, 36, 32}, .align = XENT_FLEX_ALIGN_STRETCH},
+		                    xtk_kids(
+		                        xtk_text(ui, xtk_fmt(ui, "当前词表 %d 个词", m->nwords),
+		                                 (XtkTextDesc){.size = 16, .weight = XTK_FONT_SEMI_BOLD}),
+		                        xtk_text(ui, "单条录入：写「单词 词性 释义」，点「录入」。",
+		                                 (XtkTextDesc){.size = 13, .color = COL_GRAY}),
+		                        xtk_row(ui, (XtkStackDesc){.gap = 10},
+		                            xtk_kids(
+		                                xtk_sized(xtk_textbox(ui, "如 fossil n. 化石",
+		                                    (XtkTextBoxDesc){.content = m->add_line, .change = xtk_msg(MSG_ADD_LINE)}), 440, 44),
+		                                xtk_button(ui, "录入",
+		                                    (XtkButtonDesc){.style = XTK_BUTTON_ACCENT, .click = xtk_msg(MSG_ADD_ONE)}))),
+		                        xtk_text(ui, "批量录入：在别处复制好整份词表，点「从剪贴板批量导入」。两种格式都行——",
+		                                 (XtkTextDesc){.size = 13, .color = COL_GRAY}),
+		                        xtk_text(ui, "① 先全部英文单词（一行一个），再全部中文释义（一行一个），两段数量一致",
+		                                 (XtkTextDesc){.size = 13, .color = COL_GRAY}),
+		                        xtk_text(ui, "② 每行一条：单词 词性 释义（如 fossil n. 化石）",
+		                                 (XtkTextDesc){.size = 13, .color = COL_GRAY}),
+		                        xtk_row(ui, (XtkStackDesc){.gap = 10},
+		                            xtk_kids(
+		                                xtk_button(ui, "从剪贴板批量导入",
+		                                    (XtkButtonDesc){.style = XTK_BUTTON_ACCENT, .click = xtk_msg(MSG_ADD_CLIP)}),
+		                                xtk_button(ui, m->clear_arm ? "再点一次确认清空" : "清空全部词",
+		                                    (XtkButtonDesc){.style = XTK_BUTTON_SUBTLE, .click = xtk_msg(MSG_ADD_CLEAR)}))),
+		                        m->add_msg[0] ? xtk_text(ui, m->add_msg,
+		                            (XtkTextDesc){.size = 14, .weight = XTK_FONT_SEMI_BOLD, .color = m->add_msg_color}) : NULL)))), 1.0f),
+		        xtk_row(ui, (XtkStackDesc){.padding = {32, 0, 32, 18}, .align = XENT_FLEX_ALIGN_CENTER},
+		            xtk_kids(
+		                xtk_button(ui, "返回", (XtkButtonDesc){.style = XTK_BUTTON_SUBTLE, .click = xtk_msg(MSG_ADD_BACK)}))))), 1.0f);
+	}
 
 	if (m->phase == PH_PREVIEW) {
 		/* —— 错词预览：列出全部错词，过一遍再开默写 —— */
@@ -987,7 +1466,10 @@ static XtkEl *view_impl(XtkUi *ui, void *model)
 	        /* 底部：次级操作，两端分开放 */
 	        xtk_row(ui, (XtkStackDesc){.padding = {32, 0, 32, 18}, .justify = XENT_FLEX_JUSTIFY_SPACE_BETWEEN, .align = XENT_FLEX_ALIGN_CENTER},
 	            xtk_kids(
-	                xtk_button(ui, "重新开始", (XtkButtonDesc){.style = XTK_BUTTON_SUBTLE, .click = xtk_msg(MSG_RESTART)}),
+	                xtk_row(ui, (XtkStackDesc){.gap = 10},
+	                    xtk_kids(
+	                        xtk_button(ui, "加词", (XtkButtonDesc){.style = XTK_BUTTON_SUBTLE, .click = xtk_msg(MSG_ADD)}),
+	                        xtk_button(ui, "重新开始", (XtkButtonDesc){.style = XTK_BUTTON_SUBTLE, .click = xtk_msg(MSG_RESTART)}))),
 	                xtk_button(ui, (m->mode == 1) ? "切换到「释义 → 单词」" : "切换到「单词 → 释义」",
 	                           (XtkButtonDesc){.style = XTK_BUTTON_SUBTLE, .click = xtk_msg(MSG_MODE)}))))), 1.0f);
 }
@@ -1100,6 +1582,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int showCmd)
 	m->phase = PH_NORMAL;
 	next_word(m);
 
+	/* 自测用：DICT_START_ADD=1 直接打开加词页（截图/回归用） */
+	{ const char *s = getenv("DICT_START_ADD"); if (s && *s == '1') do_open_add(m); }
+
 	FluxAppCfg cfg = {
 	    .title = L"单词默写",
 	    .width = 760,
@@ -1160,6 +1645,7 @@ static XtkEl *view_min(XtkUi *ui, void *model)
 	case 5: return view_impl(ui, model);
 	case 6: return xtk_column(ui, (XtkStackDesc){.align = XENT_FLEX_ALIGN_STRETCH, .fill = true},
 	    xtk_kids(xtk_titlebar(ui, "单词默写", (XtkTitleBarDesc){.subtitle = "Project-Xent 前端"})));   /* 不整合 */
+	case 8: m->phase = PH_ADD; m->add_line[0] = 0; m->add_msg[0] = 0; return view_impl(ui, model);
 	case 10: return xtk_column(ui, (XtkStackDesc){.align = XENT_FLEX_ALIGN_STRETCH, .fill = true},
 	    xtk_kids(xtk_card(ui, (XtkStackDesc){.gap = 16, .padding = {36, 44, 36, 44}, .align = XENT_FLEX_ALIGN_STRETCH}, xtk_kids(t1))));
 	case 11: return xtk_column(ui, (XtkStackDesc){.align = XENT_FLEX_ALIGN_STRETCH, .fill = true},
@@ -1209,6 +1695,107 @@ int main(void)
 	memcpy(m->queue, m->round_words, sizeof(int) * 3);
 	m->qlen = 3; m->pos = 0; m->phase = PH_NORMAL;
 	next_word(m);
+
+	if (g_stage == 9) {
+		/* 加词逻辑自测：两种格式解析 + 追加写文件（跑完留下 addtest_extra.json 交给 Python 校验） */
+		const char *path = "addtest_extra.json";
+		remove(path);
+		FILE *f = fopen(path, "wb");
+		fputs("[\n  [\"zeal\", \"n.\", \"热情\"]\n]\n", f);   /* 已有 1 条 */
+		fclose(f);
+		snprintf(m->root, sizeof m->root, "%s", path);
+		snprintf(m->words[m->nwords].word, DICT_MAX_WORD, "zeal");    /* 内存里也有 zeal */
+		snprintf(m->words[m->nwords].pos, DICT_MAX_POS, "n.");
+		snprintf(m->words[m->nwords].meaning, DICT_MAX_MEANING, "热情");
+		m->nwords++;
+
+		AddStat st;
+		printf("A 单行式: ");
+		add_from_text(m, "tangible adj. 有形的\ntedious adj. 乏味的\nzeal n. 热情\n", &st);
+		printf("added=%d dup=%d bad=%d err=[%s] nwords=%d\n", st.added, st.dup, st.bad, st.err, m->nwords);
+		printf("B 两段式: ");
+		add_from_text(m, "withstand\nyield\n承受\n屈服；让步\n", &st);
+		printf("added=%d dup=%d bad=%d err=[%s] nwords=%d\n", st.added, st.dup, st.bad, st.err, m->nwords);
+		printf("C 数量不一致: ");
+		add_from_text(m, "rigid\nswirl2\n僵硬的\n", &st);
+		printf("added=%d dup=%d bad=%d err=[%s]\n", st.added, st.dup, st.bad, st.err);
+		printf("D 交错混杂: ");
+		add_from_text(m, "rigid\n僵硬的\nswirl\n", &st);
+		printf("added=%d dup=%d bad=%d err=[%s]\n", st.added, st.dup, st.bad, st.err);
+		printf("E 重复词: ");
+		add_from_text(m, "swear v. 发誓\n", &st);
+		printf("added=%d dup=%d bad=%d err=[%s]\n", st.added, st.dup, st.bad, st.err);
+		printf("F 词性拆分: ");
+		{
+			char pos[DICT_MAX_POS] = {0}, mn[DICT_MAX_MEANING] = {0};
+			split_pos_meaning("n. 过程 v. 处理", pos, sizeof pos, mn, sizeof mn);
+			printf("pos=[%s] meaning=[%s]\n", pos, mn);
+			split_pos_meaning("存货 & 库存", pos, sizeof pos, mn, sizeof mn);
+			printf("   & 处理: pos=[%s] meaning=[%s]\n", pos, mn);
+		}
+		return 0;
+	}
+
+	if (g_stage == 10) {
+		/* 剪贴板导入路径自测：临时设置剪贴板 → 调 do_add_clip（按钮的真实处理函数）→ 还原剪贴板 */
+		const char *path = "addtest_extra.json";
+		remove(path);
+		FILE *f = fopen(path, "wb");
+		fputs("[\n  [\"swear\", \"v.\", \"发誓\"]\n]\n", f);
+		fclose(f);
+		snprintf(m->root, sizeof m->root, "%s", path);
+
+		/* 原剪贴板文本先存下来 */
+		wchar_t *old = NULL;
+		if (OpenClipboard(NULL)) {
+			HANDLE oh = GetClipboardData(CF_UNICODETEXT);
+			if (oh) {
+				const wchar_t *p = (const wchar_t *)GlobalLock(oh);
+				if (p) {
+					int n = lstrlenW(p) + 1;
+					old = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+					if (old) lstrcpyW(old, p);
+					GlobalUnlock(oh);
+				}
+			}
+			CloseClipboard();
+		}
+
+		const wchar_t *test = L"withstand\nyield\nzeal\n承受\n屈服；让步\n热情\n";
+		bool set_ok = false;
+		if (OpenClipboard(NULL)) {
+			EmptyClipboard();
+			HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, (lstrlenW(test) + 1) * sizeof(wchar_t));
+			if (g) {
+				wchar_t *d = (wchar_t *)GlobalLock(g);
+				if (d) { lstrcpyW(d, test); GlobalUnlock(g); set_ok = SetClipboardData(CF_UNICODETEXT, g) != NULL; }
+			}
+			CloseClipboard();
+		}
+		printf("剪贴板写入: %s\n", set_ok ? "ok" : "失败");
+
+		do_add_clip(m);                                  /* ← 「从剪贴板批量导入」按钮走的就是这个 */
+		printf("do_add_clip → msg=[%s]\n", m->add_msg);
+		printf("            nwords=%d add_line=[%s]\n", m->nwords, m->add_line);
+
+		/* 还原剪贴板 */
+		if (old) {
+			if (OpenClipboard(NULL)) {
+				EmptyClipboard();
+				HGLOBAL g2 = GlobalAlloc(GMEM_MOVEABLE, (lstrlenW(old) + 1) * sizeof(wchar_t));
+				if (g2) {
+					wchar_t *d2 = (wchar_t *)GlobalLock(g2);
+					if (d2) { lstrcpyW(d2, old); GlobalUnlock(g2); SetClipboardData(CF_UNICODETEXT, g2); }
+				}
+				CloseClipboard();
+			}
+			free(old);
+			printf("剪贴板已还原\n");
+		} else {
+			printf("原剪贴板没有文本（未还原）\n");
+		}
+		return 0;
+	}
 
 	XentCfg config = {0};
 	XentCtx *ctx = xent_ctx_create(&config);

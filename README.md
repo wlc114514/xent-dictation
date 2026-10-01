@@ -2,13 +2,16 @@
 
 用 [Project-Xent / fluxent](https://github.com/Project-Xent/fluxent)（C23 + xmake 的 Windows 原生声明式 UI 框架）写的一个英语背词程序前端：约 1200 行纯 C，没有 Web 层，没有 Qt/Electron。
 
-![截图](screenshots/dictation.png)
+![主界面](screenshots/dictation.png)
+![加词页](screenshots/add-words.png)
 
 ## 功能
 
 - **两种模式**：`释义 → 单词`（默认，带首字母提示 `s w _ _ _`）和 `单词 → 释义`（宽松中文判分）
 - **轮次**：第 1 轮全部词，错词进下一轮；全对后结束，可查看本轮错词清单
 - **判分**：字面判分（毫秒级，汉字比对 + 同义/子串宽松规则）；可选接本地小模型判分（Jev-Style-0.8B 决策模型，走 llama.cpp `llama-server` 的 `/completion`，取 ` yes` / ` no` 两个 token 的 logprob 差换算置信度）——没配就自动只用字面判分，不阻塞做题
+- **加词**：单条录入「单词 词性 释义」；或在别处复制好整份词表，点「从剪贴板批量导入」——支持 **①先全部英文单词、再全部中文释义的两段式** 和 **②每行一条 `单词 词性 释义`** 两种格式，重复词自动跳过、数量不一致/格式混杂会给出提示；「清空全部词」带二次确认
+  （框架的文本框没有多行支持，所以批量录入走剪贴板而不是粘贴框）
 - **数据文件**（放程序工作目录）：`dictation_extra.json`（词表 `[["word","pos","meaning"], ...]`）、`dictation_judge.json`（判分配置）
 
 ## 构建
@@ -53,7 +56,15 @@ root.3.0.1   d=3  rect x=   64.0 y=  286.7 w=  632.0 h=   53.3   ← 大字题�
 ```
 
 改版面时比开窗口截屏快得多——本项目的版面就是靠它调出来的（还可以用 `STAGE=<n>` 环境变量
-只渲染视图的某个子集来二分定位问题）。
+只渲染视图的某个子集来二分定位问题）：
+
+| 环境变量 | 作用 |
+|---------|------|
+| `STAGE=5` | 渲染真实主界面并 dump 布局 |
+| `STAGE=8` | 渲染加词页并 dump 布局 |
+| `STAGE=9` | 加词逻辑自测：两种格式解析 / 去重 / 数量不一致 / 交错混杂 / 词性拆分（会生成并清理 `addtest_extra.json`） |
+| `STAGE=10` | 剪贴板导入链路自测（临时改剪贴板并在结束时还原） |
+| `DICT_START_ADD=1` | 直接启动进加词页（UI 截图/回归用；框架走 `WM_POINTER`，合成鼠标事件喂不进去，所以靠这个开关切页面） |
 
 ## 踩过的框架坑（供参考）
 
@@ -67,6 +78,8 @@ root.3.0.1   d=3  rect x=   64.0 y=  286.7 w=  632.0 h=   53.3   ← 大字题�
 3. **无头测试里必须注册文本测量**：`flux_text_create()` + `flux_text_register(txt, ctx)`。
    不注册的话文本节点的布局高度会退回默认字号，大字全部重叠——看起来像布局 bug，其实是没测量。
 4. `xtk_spacer()` 是吃空间的弹性元素，和 `justify = CENTER` 混用会破坏居中。
+5. **输入走 `WM_POINTER`**：`PostMessage(WM_LBUTTONDOWN)` 和 `SendInput` 注入的点击都不会产生指针消息，框架收不到——UI 自动化测试只能改成环境变量直接切状态（见上表），别在这上面耗时间。
+6. **文本框是单行**：`XtkTextBoxDesc` 只有 `content / disabled / change`，没有多行或 placeholder 之外的样式；批量输入得自己找别的入口。
 
 ## 许可
 
