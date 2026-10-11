@@ -1,86 +1,79 @@
-# xent-dictation · 单词默写（Project-Xent / fluxent 前端）
+# xent-dictation · 单词默写
 
-用 [Project-Xent / fluxent](https://github.com/Project-Xent/fluxent)（C23 + xmake 的 Windows 原生声明式 UI 框架）写的一个英语背词程序前端：约 1200 行纯 C，没有 Web 层，没有 Qt/Electron。
-
-![主界面](screenshots/dictation.png)
-![加词页](screenshots/add-words.png)
+基于 Project-Xent / Fluxent 的 Windows 原生应用，使用 C23 和 xmake 构建。
 
 ## 功能
 
-- **两种模式**：`释义 → 单词`（默认，带首字母提示 `s w _ _ _`）和 `单词 → 释义`（宽松中文判分）
-- **轮次**：第 1 轮全部词，错词进下一轮；全对后结束，可查看本轮错词清单
-- **判分**：字面判分（毫秒级，汉字比对 + 同义/子串宽松规则）；可选接本地小模型判分（Jev-Style-0.8B 决策模型，走 llama.cpp `llama-server` 的 `/completion`，取 ` yes` / ` no` 两个 token 的 logprob 差换算置信度）——没配就自动只用字面判分，不阻塞做题
-- **加词**：单条录入「单词 词性 释义」；或在别处复制好整份词表，点「从剪贴板批量导入」——支持 **①先全部英文单词、再全部中文释义的两段式** 和 **②每行一条 `单词 词性 释义`** 两种格式，重复词自动跳过、数量不一致/格式混杂会给出提示；「清空全部词」带二次确认
-  （框架的文本框没有多行支持，所以批量录入走剪贴板而不是粘贴框）
-- **数据文件**（放程序工作目录）：`dictation_extra.json`（词表 `[["word","pos","meaning"], ...]`）、`dictation_judge.json`（判分配置）
+- 两种题型：释义 → 单词（首字母提示）、单词 → 释义。
+- 普通默写：错词进入下一轮，全部答对后完成。
+- 无尽模式：每 20 个词一组；答错后显示答案，重开时将本组见过的词打乱排在前面，未见过的词保持原顺序。整组一次答对后进入下一组。
+- 导航栏切换默写、无尽模式、词库和说明；两种练习分别保存本次运行中的进度。
+- 词库支持输入窗口和剪贴板批量导入，自动跳过重复词，清空需确认。
+- 虚拟化词表列表，按行显示序号、单词、词性与释义，修复长列表挤压重叠。
+- 可选本地 JEV 判分，后台线程处理请求。
+
+## 源码结构
+
+| 文件 | 职责 |
+|---|---|
+| dictation.c | 消息处理、窗口和入口 |
+| dict_app.h | 前端模型和消息 |
+| dict_view.c | 导航和各页面视图 |
+| dict_session.c / .h | 普通轮次与无尽模式状态机 |
+| dict_words.c / .h | 词库读写、批量导入 |
+| dict_text.c / .h | 字面判分、提示和文本工具 |
+| dict_judge.c / .h | 本地模型判分 |
+| tests/test_dict_core.c | 后端测试 |
 
 ## 构建
 
-前置：
+需要 Windows、Visual Studio 2022 C++ 桌面开发工具和 xmake 3.x。
+将 [fluxent](https://github.com/Project-Xent/fluxent)、[xent-kit](https://github.com/Project-Xent/xent-kit)、[xent-core](https://github.com/Project-Xent/xent-core)、[cwinrt](https://github.com/Project-Xent/cwinrt) 放在同级目录。
 
-- Windows 11 + Visual Studio 2022（C++ 桌面开发工作负载）
-- [xmake](https://xmake.io) 3.x
-- 框架源码（dev 布局，四个仓库放同级目录）：
-  [fluxent](https://github.com/Project-Xent/fluxent)、[xent-kit](https://github.com/Project-Xent/xent-kit)、
-  [xent-core](https://github.com/Project-Xent/xent-core)、[cwinrt](https://github.com/Project-Xent/cwinrt)
-
-步骤：
-
-1. 把本仓库的 `examples/dictation/` 整个目录放进 `fluxent/` 仓库对应位置（与其他 examples 同级）
-2. 把 `xmake-targets.lua` 里的两个 target 追加到 `fluxent/xmake.lua` 末尾
-3. 构建：
+1. 将本仓库的 examples/dictation 整个目录复制到 fluxent/examples/dictation。
+2. 将 xmake-targets.lua 中的三个目标追加到 fluxent/xmake.lua；已有同名目标时替换。
+3. 在 fluxent 目录运行：
 
 ```bat
-cd fluxent
 xmake build dictation
 ```
 
-产物在 `fluxent/build/windows/x64/release/dictation.exe`。运行时的工作目录必须是数据文件所在处
-（`run-dictation.bat` 是一个示例启动脚本，路径改成你自己的即可）。
+产物：fluxent/build/windows/x64/release/dictation.exe。
+应用使用 Fluxent 内部运行时接口，构建目标需要 include、src、src/bridge 头文件路径；框架升级可能需要调整这些接口。
 
-## 无头布局自检
+## 数据
+
+使用 dictation_extra.json 保存词表，格式为 [["word","pos","meaning"], ...]。
+dictation_judge.json 配置可选的本地判分器。仓库提供 *.sample.json 示例，复制并去掉 .sample 后使用。
+本地词库与判分配置不纳入版本控制。
+
+run-dictation.bat 是启动脚本示例，修改其中 exe 路径后使用。
+
+## 检查
+
+在 fluxent 目录运行：
 
 ```bat
+xmake build test_dict_core
+xmake run test_dict_core
 xmake build test_dict_layout
-xmake run   test_dict_layout
+xmake run test_dict_layout
 ```
 
-不开窗口，直接把当前视图里**每个节点的实际矩形**打印出来：
+布局检查只测量页面内容；导航外壳需要真实窗口后端。
 
-```
-root         d=0  rect x=    0.0 y=    0.0 w=  760.0 h=  700.0
-root.0       d=1  rect x=    0.0 y=    0.0 w=  760.0 h=   48.0   ← 标题栏
-root.3       d=1  rect x=    0.0 y=  102.0 w=  760.0 h=  548.0   ← 舞台（撑满）
-root.3.0     d=2  rect x=   28.0 y=  116.0 w=  704.0 h=  524.0   ← 卡片
-root.3.0.1   d=3  rect x=   64.0 y=  286.7 w=  632.0 h=   53.3   ← 大字题面
-```
-
-改版面时比开窗口截屏快得多——本项目的版面就是靠它调出来的（还可以用 `STAGE=<n>` 环境变量
-只渲染视图的某个子集来二分定位问题）：
-
-| 环境变量 | 作用 |
-|---------|------|
-| `STAGE=5` | 渲染真实主界面并 dump 布局 |
-| `STAGE=8` | 渲染加词页并 dump 布局 |
-| `STAGE=9` | 加词逻辑自测：两种格式解析 / 去重 / 数量不一致 / 交错混杂 / 词性拆分（会生成并清理 `addtest_extra.json`） |
-| `STAGE=10` | 剪贴板导入链路自测（临时改剪贴板并在结束时还原） |
-| `DICT_START_ADD=1` | 直接启动进加词页（UI 截图/回归用；框架走 `WM_POINTER`，合成鼠标事件喂不进去，所以靠这个开关切页面） |
-
-## 踩过的框架坑（供参考）
-
-1. **系统标题栏没被摘掉**：`.integrate_window = true` 在当前框架/系统组合下仍会画出原生标题栏
-   （官方 example 也复现），窗口顶部出现两组最小化/最大化/关闭按钮。这里的做法是启动后等窗口
-   真正可见，再自己摘掉 `WS_CAPTION`——注意**不能太早**，在窗口显示流程中改样式会让窗口一直不显示。
-   框架自己负责的拖动区、按钮命中（`HTCAPTION` / `HTMINBUTTON` / `HTMAXBUTTON`）不受影响。
-2. **要撑满的容器得 `fill + grow` 一起用**：`{ .fill = true }` 只影响容器**内部**的主轴分配；
-   在父级里占满剩余空间还需要 `xtk_grow(el, 1.0f)`。根节点同理（官方画廊的写法就是
-   `xtk_grow(xtk_column(...), 1.0f)`）。
-3. **无头测试里必须注册文本测量**：`flux_text_create()` + `flux_text_register(txt, ctx)`。
-   不注册的话文本节点的布局高度会退回默认字号，大字全部重叠——看起来像布局 bug，其实是没测量。
-4. `xtk_spacer()` 是吃空间的弹性元素，和 `justify = CENTER` 混用会破坏居中。
-5. **输入走 `WM_POINTER`**：`PostMessage(WM_LBUTTONDOWN)` 和 `SendInput` 注入的点击都不会产生指针消息，框架收不到——UI 自动化测试只能改成环境变量直接切状态（见上表），别在这上面耗时间。
-6. **文本框是单行**：`XtkTextBoxDesc` 只有 `content / disabled / change`，没有多行或 placeholder 之外的样式；批量输入得自己找别的入口。
+| 环境变量 | 页面 |
+|---|---|
+| STAGE=5 | 普通默写 |
+| STAGE=8 | 词库 |
+| STAGE=12 | 错词预览 |
+| STAGE=13 | 无尽模式答错后 |
+| STAGE=14 | 说明 |
+| STAGE=15 | 完成 |
+| DICT_START_PAGE=1 | 启动真实窗口时直接进入无尽模式 |
+| DICT_START_PAGE=3 | 直接进入词库 |
+| DICT_START_PAGE=4 | 直接进入说明 |
 
 ## 许可
 
-MIT（见 `LICENSE`）。框架本体的版权归 Project-Xent 各仓库所有；本仓库只包含应用层代码。
+MIT，见 LICENSE。框架版权归 Project-Xent 各仓库所有。
