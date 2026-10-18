@@ -11,6 +11,7 @@
 
 #include "dict_judge.h"
 #include "dict_session.h"
+#include "dict_text.h"
 #include "dict_words.h"
 
 #define DICT_MAX_ANSWER 512
@@ -33,6 +34,7 @@ enum {
 	MSG_ADD_MSG_CLOSE,
 	MSG_CLEAR_ASK,     /* 打开「清空词库」确认框 */
 	MSG_CLEAR_RESULT,  /* 确认框结果（.i = XtkDialogResult） */
+	MSG_ALL_SENSES,    /* 「多义词要全答」开关（.b = 新状态） */
 };
 
 /* 导航栏条目（下标即 MSG_NAV 的 .i） */
@@ -61,6 +63,12 @@ typedef struct Drill {
 	Feedback fb;
 	int      answered;   /* 本次练习答过的题数（统计卡用） */
 	int      correct;
+
+	/* 一词多义（单词 → 释义）：当前词拆出的义项、已答出的位掩码 */
+	char     senses[DICT_MAX_SENSES][DICT_SENSE_LEN];
+	int      nsense;
+	uint32_t got;
+	int      sense_of;   /* 义项属于哪个词（词表下标 + 1；0 = 需要重算） */
 } Drill;
 
 typedef struct App {
@@ -79,11 +87,17 @@ typedef struct App {
 	Feedback add_fb;     /* 词库页的导入结果 */
 	bool     clear_open; /* 「清空词库」确认框 */
 
+	bool all_senses;     /* 一词多义要把每个意思都答出来；关掉则答出任一个就算对 */
+	char settings_path[DICT_MAX_ANSWER];   /* dictation_settings.json（保存上面的开关） */
+
 	bool dark;
 } App;
 
 /* 当前页对应的练习（词库/说明页返回 NULL） */
 Drill *app_drill(App *a);
+
+/* 让 d->senses 对上当前题目（换词时重拆、清空已答出）；返回已答出的个数 */
+int drill_senses(const App *a, Drill *d);
 
 /* 视图入口（dict_view.c）：app_view = 导航栏 + 当前页；app_page = 只有当前页（无头布局自检用） */
 XtkEl *app_view(XtkUi *ui, void *model);

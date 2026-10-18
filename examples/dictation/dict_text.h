@@ -27,7 +27,21 @@ bool is_blank(const char *s);
 /* 「单词 → 释义」宽松判分（与 Python 版 meaning_match 同规则） */
 bool meaning_match(const char *ans, const char *meaning);
 
-/* 「释义 → 单词」首字母提示：前半段原样、其余挖空，如 "s w _ _ _" */
+/* ---- 一词多义 ---- */
+#define DICT_MAX_SENSES 16    /* 不超过 32：答出的义项用 uint32_t 位掩码记 */
+#define DICT_SENSE_LEN  128
+
+/* 把释义拆成义项：、，,；;/ 分隔，两个汉字之间的空格也算；括号里的不拆，重复的只留一个。
+ * "行为、传导; 实施、传导" → 行为 / 传导 / 实施；"使沉淀、(水汽等)凝结(成雨、露、雪等)" → 2 个 */
+int  split_senses(const char *meaning, char out[][DICT_SENSE_LEN], int max);
+
+/* 答案（可一次写多个，同样分隔）逐条对还没答出的义项，命中的在 *got 里置位；返回新答出的个数 */
+int  senses_mark(const char *ans, char senses[][DICT_SENSE_LEN], int ns, uint32_t *got);
+
+/* 「释义 → 单词」判对：不分大小写、忽略 '.'、多余空格不计（"take sth into account" == "take sth. into  account"） */
+bool answer_eq(const char *ans, const char *word);
+
+/* 「释义 → 单词」首字母提示：前半段原样、其余挖空，如 "s w _ _ _"；短语逐词处理 */
 void masked_display(const char *word, char *out, size_t cap);
 
 /* ---- 最小 JSON 工具 ---- */

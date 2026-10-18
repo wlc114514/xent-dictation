@@ -58,6 +58,43 @@ static void fb_set(Feedback *fb, XtkInfoBarSeverity sev, const char *title, cons
 
 static void fb_clear(Feedback *fb) { fb->on = false; }
 
+static int bits(uint32_t m)
+{
+	int n = 0;
+	for (; m; m &= m - 1) n++;
+	return n;
+}
+
+int drill_senses(const App *a, Drill *d)
+{
+	int idx = sess_current(&d->s);
+	if (idx < 0) { d->nsense = 0; d->sense_of = 0; return 0; }
+	if (d->sense_of != idx + 1) {
+		const char *m = a->wl.words[idx].meaning;
+		d->nsense = split_senses(m, d->senses, DICT_MAX_SENSES);
+		if (d->nsense == 0) { snprintf(d->senses[0], sizeof d->senses[0], "%s", m); d->nsense = 1; }
+		d->got      = 0;
+		d->sense_of = idx + 1;
+	}
+	return bits(d->got);
+}
+
+/* 换题 / 重答同一个词前调用：已答出的义项作废 */
+static void senses_reset(Drill *d) { d->sense_of = 0; }
+
+/* 没答出的义项，用「、」连起来 */
+static const char *senses_missing(const Drill *d, char *buf, size_t cap)
+{
+	size_t j = 0;
+	buf[0]   = 0;
+	for (int k = 0; k < d->nsense; k++) {
+		if (d->got & (1u << k)) continue;
+		j += (size_t)snprintf(buf + j, cap - j, "%s%s", j ? "、" : "", d->senses[k]);
+		if (j >= cap) break;
+	}
+	return buf;
+}
+
 /* 公布答案用：「原词 xxx」/「释义 xxx」，后面附上完整词条 */
 static const char *answer_text(const App *a, int idx, char *buf, size_t cap)
 {
@@ -78,7 +115,9 @@ static LRESULT CALLBACK bridge_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
 	if (!g_rt) return DefWindowProcW(h, msg, wp, lp);
 	if (msg == WM_BRIDGE_JUDGED) {
-		xtk_rt_post(g_rt, (XtkMsg){.tag = MSG_JUDGED, .i = (int32_t)wp, .d = (double)(LONG_PTR)lp / 1e6});
+		/* wp 低 32 位 = 请求号，高 32 位 = 判为意思接近的义项位掩码（只有一个义项时是 bit 0；义项不超过 16 个，float 装得下） */
+		xtk_rt_post(g_rt, (XtkMsg){.tag = MSG_JUDGED, .i = (int32_t)(uint32_t)wp, .f = (float)(uint32_t)((uint64_t)wp >> 32),
+		                           .d = (double)(LONG_PTR)lp / 1e6});
 		return 0;
 	}
 	if (msg == WM_BRIDGE_POST) {
@@ -107,13 +146,45 @@ typedef struct JudgeJob {
 	int    seq;
 	char   meaning[DICT_MAX_MEANING];
 	char   ans[DICT_MAX_ANSWER];
+
+	/* 要判的义项（只有一个义项时就是整条释义）和还没答出的位掩码 */
+	char     senses[DICT_MAX_SENSES][DICT_SENSE_LEN];
+	int      nsense;
+	uint32_t todo;
+	double   threshold;
 } JudgeJob;
 
+#define JUDGE_MAX_PIECES 4   /* 一次最多判答案里的前几项：每项对每个义项问一次模型（2B 约 0.4 秒一次） */
+
+/* 答案按 、，; 拆成几项，逐项对还没答出的义项判：「庞大的，微小的」整串交给模型不可靠（0.8B 会判对）。
+ * 一项答案只顶一个义项；返回判为接近的义项位掩码，*p = 命中的最低概率（没命中则为最接近的那次） */
 static DWORD WINAPI judge_thread(LPVOID param)
 {
 	JudgeJob *job = (JudgeJob *)param;
-	double    p   = judge_p(job->judge, job->meaning, job->ans);
-	PostMessageW(g_bridge, WM_BRIDGE_JUDGED, (WPARAM)job->seq, (LPARAM)(LONG_PTR)llround(p * 1e6));
+	char      parts[DICT_MAX_SENSES][DICT_SENSE_LEN];
+	int       np = split_senses(job->ans, parts, DICT_MAX_SENSES);
+	if (np == 0) { snprintf(parts[0], sizeof parts[0], "%s", job->ans); np = 1; }
+	if (np > JUDGE_MAX_PIECES) np = JUDGE_MAX_PIECES;
+
+	uint32_t hit = 0;
+	double   best = -1, worst_hit = 2;
+	for (int i = 0; i < np; i++) {
+		for (int k = 0; k < job->nsense; k++) {
+			if (!(job->todo & (1u << k)) || (hit & (1u << k))) continue;
+			double q = judge_p(job->judge, job->senses[k], parts[i]);
+			if (q < 0) goto done;   /* 模型不可用 */
+			if (q > best) best = q;
+			if (q >= job->threshold) {
+				hit |= 1u << k;
+				if (q < worst_hit) worst_hit = q;
+				break;
+			}
+		}
+	}
+done:;
+	double   p  = hit ? worst_hit : best;
+	WPARAM   wp = (WPARAM)(((uint64_t)hit << 32) | (uint32_t)job->seq);
+	PostMessageW(g_bridge, WM_BRIDGE_JUDGED, wp, (LPARAM)(LONG_PTR)llround(p * 1e6));
 	free(job);
 	return 0;
 }
@@ -127,6 +198,16 @@ static bool start_judging(App *a, Drill *d, const Word *w)
 	job->seq   = ++a->judge_seq;
 	snprintf(job->meaning, sizeof job->meaning, "%s", w->meaning);
 	snprintf(job->ans, sizeof job->ans, "%s", a->answer);
+	job->threshold = judge_threshold(a->judge);
+	if (d->nsense > 1) {
+		memcpy(job->senses, d->senses, sizeof job->senses);
+		job->nsense = d->nsense;
+		job->todo   = ~d->got;
+	} else {
+		snprintf(job->senses[0], sizeof job->senses[0], "%s", w->meaning);
+		job->nsense = 1;
+		job->todo   = 1;
+	}
 	HANDLE h = CreateThread(NULL, 0, judge_thread, job, 0, NULL);
 	if (!h) { free(job); return false; }
 	CloseHandle(h);
@@ -161,16 +242,26 @@ static void apply_verdict(App *a, Drill *d, bool ok, double p)
 		if (p >= 0) fb_set(&d->fb, XTK_INFOBAR_SUCCESS, "答对了", "本地模型判为意思接近（%.2f）· %s  %s", p, w->word, w->meaning);
 		else        fb_set(&d->fb, XTK_INFOBAR_SUCCESS, "答对了", "%s  %s  %s", w->word, w->pos, w->meaning);
 		a->answer[0] = 0;
-	} else if (d->s.phase == SP_REVEALED) {          /* 无尽模式：错一次就公布答案 */
+	} else if (d->s.phase == SP_REVEALED) {          /* 点「不知道」后公布答案并等待重开 */
 		d->answered++;
 		answer_text(a, idx, ans, sizeof ans);
-		if (p >= 0) fb_set(&d->fb, XTK_INFOBAR_ERROR, "答错了，本组要重新开始", "接近度 %.2f · 正确答案：%s", p, ans);
-		else        fb_set(&d->fb, XTK_INFOBAR_ERROR, "答错了，本组要重新开始", "正确答案：%s", ans);
+		if (p >= 0) fb_set(&d->fb, XTK_INFOBAR_ERROR, "已公布答案", "接近度 %.2f · 正确答案：%s", p, ans);
+		else        fb_set(&d->fb, XTK_INFOBAR_ERROR, "已公布答案", "正确答案：%s", ans);
 		a->answer[0] = 0;
 	} else {                                          /* 普通模式：可再试 */
 		if (p >= 0) fb_set(&d->fb, XTK_INFOBAR_ERROR, "答错了", "接近度 %.2f。再试一次，或点「不知道」看答案。", p);
 		else        fb_set(&d->fb, XTK_INFOBAR_ERROR, "答错了", "再试一次，或点「不知道」看答案。");
 	}
+}
+
+/* 一词多义答出了 fresh 个新义项：全齐了（或开关关着、答出一个就够）算答对，否则清空输入框接着写 */
+static void senses_progress(App *a, Drill *d, int fresh, double p)
+{
+	int left = d->nsense - bits(d->got);
+	if (left == 0 || !a->all_senses) { apply_verdict(a, d, true, p); return; }
+	if (p >= 0) fb_set(&d->fb, XTK_INFOBAR_SUCCESS, "答对一个", "本地模型判为意思接近（%.2f）。还差 %d 个意思，接着写。", p, left);
+	else        fb_set(&d->fb, XTK_INFOBAR_SUCCESS, fresh > 1 ? "答对几个" : "答对一个", "还差 %d 个意思，接着写。", left);
+	a->answer[0] = 0;
 }
 
 static void do_submit(App *a)
@@ -180,23 +271,36 @@ static void do_submit(App *a)
 	const Word *w = &a->wl.words[sess_current(&d->s)];
 
 	if (a->dir == DIR_CN2EN) {
-		apply_verdict(a, d, str_ci_eq(a->answer, w->word), -1);
+		apply_verdict(a, d, answer_eq(a->answer, w->word), -1);
 		return;
 	}
-	if (meaning_match(a->answer, w->meaning)) {
+	drill_senses(a, d);
+	if (d->nsense > 1) {
+		/* 一词多义：每次答出一个（或几个），全部答出才算这个词对（开关关掉时答出一个就算） */
+		int fresh = senses_mark(a->answer, d->senses, d->nsense, &d->got);
+		if (fresh > 0) { senses_progress(a, d, fresh, -1); return; }
+	} else if (meaning_match(a->answer, w->meaning)) {
 		apply_verdict(a, d, true, -1);
 		return;
 	}
 	if (!start_judging(a, d, w)) apply_verdict(a, d, false, -1);
 }
 
-static void on_judged(App *a, int seq, double p)
+static void on_judged(App *a, int seq, double p, uint32_t hit)
 {
 	Drill *d = app_drill(a);
 	if (!d || !a->judging || seq != a->judge_seq) return;   /* 过期结果（期间切了页/题型） */
 	a->judging = false;
+	if (d->nsense > 1) {
+		hit &= ~d->got & ((1u << d->nsense) - 1);
+		if (hit) {
+			d->got |= hit;
+			senses_progress(a, d, bits(hit), p);
+			return;
+		}
+	}
 	if (p < 0) apply_verdict(a, d, false, -1);              /* 模型不可用：按字面判错 */
-	else       apply_verdict(a, d, p >= judge_threshold(a->judge), p);
+	else       apply_verdict(a, d, hit != 0, p);
 }
 
 static void do_dont(App *a)
@@ -204,11 +308,16 @@ static void do_dont(App *a)
 	Drill *d = app_drill(a);
 	if (!d || a->judging || (d->s.phase != SP_ASKING && d->s.phase != SP_WRONG)) return;
 	int  idx = sess_current(&d->s);
-	char t[800];
+	char t[800], miss[600] = "";
 	sess_dont_know(&d->s);
 	d->answered++;
-	if (d->s.kind == SESS_ENDLESS) fb_set(&d->fb, XTK_INFOBAR_ERROR, "本组要重新开始", "正确答案：%s", answer_text(a, idx, t, sizeof t));
-	else                           fb_set(&d->fb, XTK_INFOBAR_WARNING, "答案", "%s", answer_text(a, idx, t, sizeof t));
+	answer_text(a, idx, t, sizeof t);
+	if (a->dir == DIR_EN2CN && d->nsense > 1 && d->got) {   /* 答出过一部分：点明还漏了哪些 */
+		char m[500];
+		snprintf(miss, sizeof miss, "\n没答出：%s", senses_missing(d, m, sizeof m));
+	}
+	if (d->s.kind == SESS_ENDLESS) fb_set(&d->fb, XTK_INFOBAR_ERROR, "本组要重新开始", "正确答案：%s%s", t, miss);
+	else                           fb_set(&d->fb, XTK_INFOBAR_WARNING, "答案", "%s%s", t, miss);
 	a->answer[0] = 0;
 }
 
@@ -221,6 +330,7 @@ static void do_next(App *a)
 	int group    = d->s.group;
 	int restarts = d->s.restarts;
 	int skipped  = sess_next(&d->s);
+	senses_reset(d);
 
 	a->answer[0] = 0;
 	fb_clear(&d->fb);
@@ -238,10 +348,42 @@ static void do_next(App *a)
 	}
 }
 
+/* 设置只有一项，存成 {"all_senses": true} */
+static void settings_load(App *a)
+{
+	a->all_senses = true;   /* 默认要全答 */
+	char *buf = read_file(a->settings_path, NULL);
+	if (!buf) return;
+	const char *v = json_find_key(buf, "all_senses");
+	if (v && strncmp(v, "false", 5) == 0) a->all_senses = false;
+	free(buf);
+}
+
+static void settings_save(const App *a)
+{
+	FILE *f = u8_fopen(a->settings_path, "wb");
+	if (!f) return;
+	fprintf(f, "{\n  \"all_senses\": %s\n}\n", a->all_senses ? "true" : "false");
+	fclose(f);
+}
+
+/* 「多义词要全答」开关：关掉时，正答到一半的词已答出过意思就直接算对 */
+static void do_all_senses(App *a, bool on)
+{
+	if (a->all_senses == on) return;
+	a->all_senses = on;
+	settings_save(a);
+	Drill *d = app_drill(a);
+	if (!on && d && !a->judging && a->dir == DIR_EN2CN && d->got &&
+	    (d->s.phase == SP_ASKING || d->s.phase == SP_WRONG))
+		apply_verdict(a, d, true, -1);
+}
+
 static void reset_drill(Drill *d)
 {
 	d->answered = d->correct = 0;
 	fb_clear(&d->fb);
+	senses_reset(d);
 }
 
 static void do_restart(App *a)
@@ -259,6 +401,7 @@ static void do_start_round(App *a)
 	Drill *d = app_drill(a);
 	if (!d) return;
 	sess_next_round(&d->s);
+	senses_reset(d);
 	fb_clear(&d->fb);
 	a->answer[0] = 0;
 }
@@ -284,6 +427,7 @@ static void do_dir(App *a, int dir)
 	for (int i = 0; i < 2; i++) {
 		Drill *d = &a->drill[i];
 		sess_reask(&d->s);
+		senses_reset(d);
 		if (!sess_failed(&d->s) && d->s.phase != SP_DONE) fb_clear(&d->fb);
 	}
 	a->answer[0] = 0;
@@ -377,7 +521,7 @@ static void update(void *model, XtkMsg msg)
 	case MSG_NEXT:          do_next(a);                      break;
 	case MSG_RESTART:       do_restart(a);                   break;
 	case MSG_START_ROUND:   do_start_round(a);               break;
-	case MSG_JUDGED:        on_judged(a, msg.i, msg.d);      break;
+	case MSG_JUDGED:        on_judged(a, msg.i, msg.d, (uint32_t)msg.f); break;
 	case MSG_GO_LIBRARY:    do_nav(a, PAGE_LIBRARY);         break;
 	case MSG_ADD_DIALOG:    show_add_dialog(a);              break;
 	case MSG_ADD_DONE:      break;   /* 结果已写进 add_fb，这里只为触发重绘 */
@@ -385,6 +529,7 @@ static void update(void *model, XtkMsg msg)
 	case MSG_ADD_MSG_CLOSE: fb_clear(&a->add_fb);            break;
 	case MSG_CLEAR_ASK:     a->clear_open = true;            break;
 	case MSG_CLEAR_RESULT:  do_clear_result(a, msg.i);       break;
+	case MSG_ALL_SENSES:    do_all_senses(a, msg.b);         break;
 	default: break;
 	}
 }
@@ -468,7 +613,7 @@ static LRESULT CALLBACK add_dialog_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
 		d->font = CreateFontIndirectW(&ncm.lfMessageFont);
 
 		d->label = add_child(hwnd, L"STATIC",
-		    L"每行「单词 词性 释义」，或者：\r\n上半部分英文（一行一词），下半部分中文释义（一行一条）",
+		    L"每行「单词或短语 词性 释义」，如 account for v. 解释、导致\r\n或者英文、中文一行一行交替；或者上半部分全英文、下半部分全中文",
 		    SS_LEFT, 0, 0, d->font);
 		d->edit = add_child(hwnd, L"EDIT", L"", WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
 		                    WS_EX_CLIENTEDGE, 0, d->font);
@@ -613,6 +758,8 @@ static void app_init(App *a, const char *words_path, const char *judge_path)
 	resolve_path(words_path, path, (int)sizeof path);
 	words_load(&a->wl, path);   /* 读不出来就是空表，界面会提示 */
 	a->judge = judge_create(judge_path, resolve_path);
+	resolve_path("dictation_settings.json", a->settings_path, (int)sizeof a->settings_path);
+	settings_load(a);
 	a->dark  = flux_theme_systemdark();
 	uint64_t seed = make_seed();
 	sess_seed(&a->drill[0].s, seed);

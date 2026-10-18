@@ -137,6 +137,9 @@ static XtkEl *drill_tools(XtkUi *ui, const App *a, bool endless)
 	    xtk_kids(
 	        xtk_selector(ui, (XtkSelectorBarDesc){.items = DIR_ITEMS, .nitem = 2, .sel = (int)a->dir, .select = xtk_msg(MSG_DIR)}),
 	        xtk_tooltip(ui,
+	            xtk_checkbox(ui, "多义词全答", (XtkToggleDesc){.checked = a->all_senses, .change = xtk_msg(MSG_ALL_SENSES)}),
+	            a->all_senses ? "单词 → 释义：有几个意思要全部写出来" : "单词 → 释义：写出任意一个意思就算对"),
+	        xtk_tooltip(ui,
 	            xtk_button(ui, NULL, (XtkButtonDesc){.style = XTK_BUTTON_SUBTLE, .icon = "Refresh", .click = xtk_msg(MSG_RESTART)}),
 	            endless ? "从第 1 组重新开始" : "从第 1 轮重新开始")));
 }
@@ -197,6 +200,23 @@ static XtkEl *view_done(XtkUi *ui, const App *a, const Drill *d, bool endless)
 	                       (XtkButtonDesc){.style = XTK_BUTTON_ACCENT, .icon = "Refresh", .click = xtk_msg(MSG_RESTART)}))), 1.0f)));
 }
 
+/* 一词多义的进度：答出的打勾，没答出的留空（公布答案后标出漏掉的） */
+static XtkEl *view_senses(XtkUi *ui, const App *a, const Drill *d, int got, bool revealed)
+{
+	char   line[DICT_MAX_SENSES * (DICT_SENSE_LEN + 16)];
+	size_t j = 0;
+	for (int k = 0; k < d->nsense && j < sizeof line; k++) {
+		const char *gap = k ? "　　" : "";
+		if (d->got & (1u << k)) j += (size_t)snprintf(line + j, sizeof line - j, "%s✓ %s", gap, d->senses[k]);
+		else if (revealed)      j += (size_t)snprintf(line + j, sizeof line - j, "%s✗ %s", gap, d->senses[k]);
+		else                    j += (size_t)snprintf(line + j, sizeof line - j, "%s＿＿＿", gap);
+	}
+	return xtk_column(ui, (XtkStackDesc){.gap = 6, .align = XENT_FLEX_ALIGN_CENTER},
+	    xtk_kids(
+	        caption(ui, xtk_fmt(ui, "共 %d 个意思 · 已答出 %d 个", d->nsense, got)),
+	        xtk_text(ui, xtk_fmt(ui, "%s", line), (XtkTextDesc){.size = 18, .weight = XTK_FONT_SEMI_BOLD, .align = XTK_TEXT_CENTER, .color = accent(a)})));
+}
+
 static XtkEl *view_drill(XtkUi *ui, App *a, Drill *d, bool endless)
 {
 	const Session *s     = &d->s;
@@ -225,6 +245,8 @@ static XtkEl *view_drill(XtkUi *ui, App *a, Drill *d, bool endless)
 	XtkEl *prompt, *hint = NULL;
 	if (a->dir == DIR_EN2CN) {
 		prompt = xtk_text(ui, w->word, (XtkTextDesc){.size = 52, .weight = XTK_FONT_SEMI_BOLD, .align = XTK_TEXT_CENTER});
+		int got = drill_senses(a, d);
+		if (d->nsense > 1 && a->all_senses) hint = view_senses(ui, a, d, got, s->phase == SP_REVEALED);
 	} else {
 		char masked[256];
 		masked_display(w->word, masked, sizeof masked);
@@ -249,7 +271,7 @@ static XtkEl *view_drill(XtkUi *ui, App *a, Drill *d, bool endless)
 		break;
 	case SP_WRONG:
 		act1 = xtk_button(ui, "不知道", (XtkButtonDesc){.style = XTK_BUTTON_SUBTLE, .icon = "Help", .disabled = busy, .click = xtk_msg(MSG_DONT)});
-		act2 = xtk_button(ui, "跳过", (XtkButtonDesc){.icon = "Next", .disabled = busy, .click = xtk_msg(MSG_NEXT)});
+		act2 = endless ? NULL : xtk_button(ui, "跳过", (XtkButtonDesc){.icon = "Next", .disabled = busy, .click = xtk_msg(MSG_NEXT)});
 		break;
 	case SP_CORRECT:
 		act1 = xtk_button(ui, "下一个", (XtkButtonDesc){.style = XTK_BUTTON_ACCENT, .icon = "Next", .click = xtk_msg(MSG_NEXT)});
@@ -307,7 +329,8 @@ static XtkEl *view_library(XtkUi *ui, App *a)
 	                                               .click = xtk_msg(MSG_CLEAR_ASK)})),
 	    feedback_bar(ui, &a->add_fb, xtk_msg(MSG_ADD_MSG_CLOSE)),
 	    section(ui, "添加单词",
-	        "每行一条「单词 词性 释义」（如 fossil n. 化石）；或者先写全部英文单词、再写对应的中文释义，两段数量一致。已在词库里的词自动跳过。",
+	        "每行一条「单词 词性 释义」，单词可以是短语（如 account for v. 解释、导致；也可以用 Tab 或 = 隔开）；"
+	        "或者英文、中文一行一行交替；或者先写全部英文、再写对应的中文，两段数量一致。已在词库里的词自动跳过。",
 	        xtk_row(ui, (XtkStackDesc){.gap = 8},
 	            xtk_kids(
 	                xtk_button(ui, "打开输入窗口", (XtkButtonDesc){.style = XTK_BUTTON_ACCENT, .icon = "Add", .click = xtk_msg(MSG_ADD_DIALOG)}),
@@ -338,11 +361,15 @@ static XtkEl *view_help(XtkUi *ui)
 	            "一轮结束后先看错词清单，下一轮只默错的词，直到全部答对。")),
 	        section(ui, "无尽模式", NULL, para(ui,
 	            "词表按顺序每 20 个分一组，组内按原顺序出题。\n"
-	            "只要错一次（答错或点「不知道」），就公布答案，点「重新开始本组」：本组见过的词（之前答对的和这次错的）打乱顺序排在前面，没见过的词保持原顺序跟在后面，从头再答。\n"
+	            "提交答错可以继续重试；点「不知道」才公布答案并触发本组重开：本组见过的词（之前答对的和这次错的）打乱顺序排在前面，没见过的词保持原顺序跟在后面，从头再答。\n"
 	            "整组一次不错地答完才进入下一组，上一组的词不再出现；所有组都过关才算完成。")),
 	        section(ui, "题型与判分", NULL, para(ui,
 	            "释义 → 单词：看中文写英文，下方蓝色字母是开头提示，不分大小写。\n"
-	            "单词 → 释义：看英文写中文，写出任意一个义项就算对；字面判不出时，会请本地小模型判断意思是否接近。")),
+	            "单词 → 释义：看英文写中文。有多个意思的词（释义里用 、 ; 或空格隔开）要把每个意思都写出来："
+	            "一次写一个，也可以一次写几个用 、 隔开；答出的会打勾，全部答出才算对，括号里的注释不用写。"
+	            "右上角取消勾选「多义词全答」后，写出任意一个意思就算对（开关会记住）。"
+	            "字面判不出时，会请本地小模型判断意思是否接近。\n"
+	            "短语按整条比对：不分大小写，多余的空格和 sth. 的点号不计较。")),
 	        section(ui, "快捷键", NULL, para(ui, "输入框里按回车 = 提交；答完后按回车 = 下一个（无尽模式里是重新开始本组）。")))));
 }
 

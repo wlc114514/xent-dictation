@@ -45,6 +45,18 @@ xmake build dictation
 
 使用 dictation_extra.json 保存词表，格式为 [["word","pos","meaning"], ...]。
 dictation_judge.json 配置可选的本地判分器。仓库提供 *.sample.json 示例，复制并去掉 .sample 后使用。
+
+判分器有两种（`api` 字段）：
+- 不写：0.8B（Jev-Style-0.8B-Decision-v3），程序拉起 llama-server，过线 0.9。
+- `"api": "judge"`：2B（Jev-Style-2B-Decision-v3），更准（尤其不会把「严肃的」判成「严酷的」），约 0.4 秒一次、占内存约 2.3GB。
+  2B 要块注意力，llama-server 跑不了，要用作者的打分程序 jev-score-v2（对着 llama.cpp 441df11f 编译）和官方 Python 运行时；
+  `tools/jev2b_server.py` 把它包成本地服务（`POST /judge`），放到模型目录里，按 `dictation_judge.2b.sample.json` 配置。
+  服务把 2B 的原始概率在对数几率上平移，原始 0.55 映射成 0.9（`--pass-at`），所以过线和 0.8B 一样写 0.9；映射是单调的，等于原始分过线 0.55（在 170 组标注释义对上扫出来的）。
+  程序退出时连同服务和打分程序一起结束（作业对象）。
+
+答案里写了几项（、，; 隔开）时逐项判，一项只顶一个义项。
+
+一词多义默认要把每个意思都写出来；练习页右上角取消勾选「多义词全答」后，答出任意一个意思就算对。开关保存在 dictation_settings.json。
 本地词库与判分配置不纳入版本控制。
 
 run-dictation.bat 是启动脚本示例，修改其中 exe 路径后使用。

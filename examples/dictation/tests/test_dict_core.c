@@ -85,6 +85,38 @@ static void test_text(void)
 	CHECK(strcmp(m, "s w _ _ _") == 0, "得到 [%s]", m);
 	masked_display("a", m, sizeof m);
 	CHECK(strcmp(m, "_") == 0, "得到 [%s]", m);
+	masked_display("account for", m, sizeof m);
+	CHECK(strcmp(m, "a c c _ _ _ _   f _ _") == 0, "短语逐词提示，得到 [%s]", m);
+	masked_display("well-known", m, sizeof m);
+	CHECK(strcmp(m, "w e l l - _ _ _ _ _") == 0, "连字符照常显示，得到 [%s]", m);
+
+	CASE("短语判对 answer_eq");
+	CHECK(answer_eq("Take sth  into account ", "take sth. into account"), "大小写/多余空格/点号不计");
+	CHECK(!answer_eq("take into account", "take sth. into account"), "少词不算对");
+	CHECK(!answer_eq("", ""), "空答案不算对");
+
+	CASE("一词多义 · 拆义项");
+	char sn[DICT_MAX_SENSES][DICT_SENSE_LEN];
+	int  ns = split_senses("行为、传导; 实施、传导", sn, DICT_MAX_SENSES);
+	CHECK(ns == 3 && !strcmp(sn[0], "行为") && !strcmp(sn[1], "传导") && !strcmp(sn[2], "实施"), "ns=%d", ns);
+	ns = split_senses("使沉淀、(水汽等)凝结(成雨、露、雪等)", sn, DICT_MAX_SENSES);
+	CHECK(ns == 2 && !strcmp(sn[1], "(水汽等)凝结(成雨、露、雪等)"), "括号里的顿号不拆：ns=%d [%s]", ns, sn[1]);
+	ns = split_senses("逆转、使 (决定、政策、趋势) 转向", sn, DICT_MAX_SENSES);
+	CHECK(ns == 2 && !strcmp(sn[1], "使 (决定、政策、趋势) 转向"), "ns=%d [%s]", ns, sn[1]);
+	ns = split_senses("媒介、手段 中等的", sn, DICT_MAX_SENSES);
+	CHECK(ns == 3 && !strcmp(sn[2], "中等的"), "汉字间空格拆：ns=%d", ns);
+	ns = split_senses("（气候或地区)温和的", sn, DICT_MAX_SENSES);
+	CHECK(ns == 1, "括号不配对也不拆：ns=%d", ns);
+
+	CASE("一词多义 · 逐条判");
+	ns = split_senses("易得到的(8)、浅显易懂的(1)", sn, DICT_MAX_SENSES);
+	uint32_t got = 0;
+	CHECK(senses_mark("易得到的", sn, ns, &got) == 1 && got == 1u, "括号注释不用写：got=%u", got);
+	CHECK(senses_mark("易得到的", sn, ns, &got) == 0, "答过的不重复计");
+	CHECK(senses_mark("没关系", sn, ns, &got) == 0 && got == 1u, "答错不置位");
+	ns  = split_senses("精心设计的、复杂的、详尽的; 详细解释、发展", sn, DICT_MAX_SENSES);
+	got = 0;
+	CHECK(senses_mark("发展，复杂的 详尽的", sn, ns, &got) == 3, "一次写多个：got=%u", got);
 
 	CASE("其它工具");
 	CHECK(str_ci_eq("Equity", "equity"), "大小写不敏感");
@@ -124,6 +156,19 @@ static void test_words(void)
 	words_add_text(&WL, "tangible adj. 有形的\ntedious adj. 乏味的\nzeal n. 热情\n", &st);
 	CHECK(st.added == 2 && st.dup == 1 && !st.err[0], "added=%d dup=%d err=%s", st.added, st.dup, st.err);
 
+	CASE("批量导入 · 短语");
+	words_add_text(&WL, "account for v. 解释、导致\ntake sth. into account 考虑到\nset off: 出发\nlook up\tv.\t查阅\n", &st);
+	CHECK(st.added == 4 && !st.err[0], "added=%d bad=%d err=%s", st.added, st.bad, st.err);
+	CHECK(!strcmp(WL.words[WL.n - 4].word, "account for") && !strcmp(WL.words[WL.n - 4].pos, "v.")
+	      && !strcmp(WL.words[WL.n - 4].meaning, "解释、导致"), "[%s][%s][%s]",
+	      WL.words[WL.n - 4].word, WL.words[WL.n - 4].pos, WL.words[WL.n - 4].meaning);
+	CHECK(!strcmp(WL.words[WL.n - 3].word, "take sth. into account"), "[%s]", WL.words[WL.n - 3].word);
+	CHECK(!strcmp(WL.words[WL.n - 2].word, "set off"), "分隔符去掉：[%s]", WL.words[WL.n - 2].word);
+	CHECK(!strcmp(WL.words[WL.n - 1].word, "look up") && !strcmp(WL.words[WL.n - 1].pos, "v."), "Tab 分列：[%s][%s]",
+	      WL.words[WL.n - 1].word, WL.words[WL.n - 1].pos);
+	words_add_text(&WL, "conduct n. v. 行为; 实施\n", &st);
+	CHECK(st.added == 1 && !strcmp(WL.words[WL.n - 1].pos, "n. v."), "多个词性：[%s]", WL.words[WL.n - 1].pos);
+
 	CASE("批量导入 · 两段式");
 	words_add_text(&WL, "withstand\nyield\n承受\n屈服；让步\n", &st);
 	CHECK(st.added == 2 && !st.err[0], "added=%d err=%s", st.added, st.err);
@@ -134,6 +179,11 @@ static void test_words(void)
 	words_add_text(&WL, "rigid\n僵硬的\nswirl\n", &st);
 	CHECK(st.added == 0 && strstr(st.err, "格式混杂"), "err=%s", st.err);
 
+	CASE("批量导入 · 英中交替");
+	words_add_text(&WL, "give up\n放弃\nturn  down\nv. 拒绝、调低\n", &st);
+	CHECK(st.added == 2 && !strcmp(WL.words[WL.n - 1].word, "turn down") && !strcmp(WL.words[WL.n - 1].pos, "v."),
+	      "added=%d err=%s [%s]", st.added, st.err, WL.n ? WL.words[WL.n - 1].word : "");
+
 	CASE("词性拆分");
 	char pos[DICT_MAX_POS], mn[DICT_MAX_MEANING];
 	split_pos_meaning("n. 过程 v. 处理", pos, sizeof pos, mn, sizeof mn);
@@ -143,10 +193,10 @@ static void test_words(void)
 
 	CASE("追加后文件可重新读回、原有内容保留");
 	static WordList again;
-	CHECK(words_load(&again, path) && again.n == 6, "重新读到 %d 个", again.n);
-	CHECK(strcmp(again.words[0].word, "zeal") == 0 && strcmp(again.words[5].word, "yield") == 0,
-	      "首=%s 尾=%s", again.words[0].word, again.words[5].word);
-	CHECK(strcmp(again.words[5].meaning, "屈服；让步") == 0, "释义=%s", again.words[5].meaning);
+	CHECK(words_load(&again, path) && again.n == 13, "重新读到 %d 个", again.n);
+	CHECK(strcmp(again.words[0].word, "zeal") == 0 && strcmp(again.words[12].word, "turn down") == 0,
+	      "首=%s 尾=%s", again.words[0].word, again.words[12].word);
+	CHECK(strcmp(again.words[10].meaning, "屈服；让步") == 0, "释义=%s", again.words[10].meaning);
 
 	CASE("清空");
 	words_clear(&WL);
@@ -253,14 +303,19 @@ static void test_endless(void)
 	CHECKQ(sess_current(&S) == 0 && S.queue[1] == 1, "重开后应先考词0、再考词1");
 	CHECK(S.restarts == 1, "restarts=%d", S.restarts);
 
-	CASE("需求：答错（不只是点「不知道」）也触发重开");
+	CASE("需求：提交答错只允许重试，不触发重开");
 	sess_answer(&S, false);
-	CHECK(S.phase == SP_REVEALED && sess_failed(&S), "phase=%d", S.phase);
+	CHECK(S.phase == SP_WRONG && !sess_failed(&S), "phase=%d", S.phase);
+	int before_pos = S.pos;
+	sess_next(&S);
+	CHECK(S.pos == before_pos && S.restarts == 1, "提交答错后不能跳题或重开");
+	sess_answer(&S, true);
+	sess_next(&S);
 
 	CASE("需求：错了以后点「重新开始」必定重置，不会正常进入下一个词");
 	sess_start_endless(&S, 45);
 	ok_next(&S); ok_next(&S); ok_next(&S);   /* 答对 0,1,2 */
-	sess_answer(&S, false);                  /* 词 3 答错 */
+	sess_dont_know(&S);                      /* 词 3 点「不知道」 */
 	sess_next(&S);
 	CHECK(S.pos == 0 && S.phase == SP_ASKING && S.restarts == 1, "pos=%d", S.pos);
 
@@ -342,14 +397,18 @@ static void test_endless(void)
 	for (int i = 0; i < 13; i++) ok_next(&S);
 	CHECK(S.gstart == 33 && S.gend == 50, "加的词应从 33 接着分组：[%d,%d)", S.gstart, S.gend);
 
-	CASE("无尽模式切换题型：已错的不撤销，没错的重新作答");
+	CASE("无尽模式切换题型：已点不知道的不撤销，提交答错可重新作答");
 	sess_start_endless(&S, 45);
 	sess_answer(&S, true);
 	sess_reask(&S);
 	CHECK(S.phase == SP_ASKING, "答对后切题型应回到作答");
+	sess_answer(&S, false);
+	CHECK(S.phase == SP_WRONG, "提交答错不应公布答案");
+	sess_reask(&S);
+	CHECK(S.phase == SP_ASKING, "提交答错切题型应可重新作答");
 	sess_dont_know(&S);
 	sess_reask(&S);
-	CHECK(S.phase == SP_REVEALED, "错了切题型不能逃过重开");
+	CHECK(S.phase == SP_REVEALED, "点不知道后切题型仍应保留重开状态");
 }
 
 /* 随机「学生」跑完整个无尽模式，每一步检查不变量 */
@@ -373,10 +432,17 @@ static void test_endless_fuzz(void)
 				ok_next(&S);
 			} else {
 				int seen_before = S.seen > S.pos + 1 ? S.seen : S.pos + 1;
-				(r >> 40) & 1 ? sess_dont_know(&S) : sess_answer(&S, false);
-				if (!sess_failed(&S)) { bad = 3; break; }
-				sess_next(&S);
-				if (S.pos != 0 || S.seen != seen_before) { bad = 4; break; }
+				if ((r >> 40) & 1) {
+					sess_dont_know(&S);
+					if (!sess_failed(&S)) { bad = 3; break; }
+					sess_next(&S);
+					if (S.pos != 0 || S.seen != seen_before) { bad = 4; break; }
+				} else {
+					sess_answer(&S, false);
+					if (S.phase != SP_WRONG || sess_failed(&S)) { bad = 5; break; }
+					sess_answer(&S, true);
+					sess_next(&S);
+				}
 				int prev = -1;
 				for (int i = S.seen; i < S.qlen; i++) {   /* 没见过的词保持原顺序 */
 					if (S.queue[i] < prev) { bad = 5; break; }

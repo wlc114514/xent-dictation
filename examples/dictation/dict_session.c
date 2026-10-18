@@ -199,10 +199,8 @@ void sess_answer(Session *s, bool correct)
 	if (s->phase != SP_ASKING && s->phase != SP_WRONG) return;
 	if (correct) {
 		s->phase = SP_CORRECT;
-	} else if (s->kind == SESS_ENDLESS) {
-		s->phase = SP_REVEALED;            /* 无尽模式：错一次就要重开本组 */
 	} else {
-		s->phase = SP_WRONG;               /* 普通模式：可再试 */
+		s->phase = SP_WRONG;               /* 提交答错只允许重试；「不知道」才公布答案并重开 */
 	}
 }
 
@@ -221,7 +219,8 @@ int sess_next(Session *s)
 		if (s->kind == SESS_ENDLESS) endless_advance(s);
 		else                         rounds_advance(s);
 		break;
-	case SP_WRONG:                         /* 只有普通模式会进 SP_WRONG */
+	case SP_WRONG:
+		if (s->kind == SESS_ENDLESS) break;  /* 无尽模式只能靠「不知道」触发重开 */
 		skipped = s->queue[s->pos];
 		mark_wrong(s, skipped);
 		rounds_advance(s);

@@ -233,20 +233,69 @@ void split_pos_meaning(const char *rest, char *pos, size_t pc, char *meaning, si
 /* 批量导入                                                            */
 /* ================================================================== */
 
-/* 取行首的「单词」，返回其余部分（没有词/没有其余部分 → NULL） */
-static const char *split_first_word(const char *line, char *word, size_t wc)
+/* 汉字及中文/全角标点：单行式里英文部分到此为止 */
+static bool is_zh_cp(uint32_t cp)
+{
+	return (cp >= 0x3000 && cp <= 0x9FFF) || (cp >= 0xFF00 && cp <= 0xFFEF);
+}
+
+/* 单词与释义之间可写的分隔符，切出单词后从尾部去掉 */
+static bool is_sep(char c) { return c && strchr(" \t=:-|,;/", c) != NULL; }
+
+/* 复制 [p, e) 到 word，连续空白压成一个空格 */
+static void copy_word(const char *p, const char *e, char *word, size_t wc)
+{
+	size_t j  = 0;
+	bool   sp = false;
+	for (; p < e && j + 2 < wc; p++) {
+		if (*p == ' ' || *p == '\t') { if (j > 0) sp = true; continue; }
+		if (sp) { word[j++] = ' '; sp = false; }
+		word[j++] = *p;
+	}
+	word[j] = 0;
+}
+
+/* 切出行首的单词或短语，返回其余部分（词性 + 释义；没有词/没有其余部分 → NULL）：
+ *   有 Tab   → Tab 前整段是单词（表格里复制出来的）
+ *   有中文   → 第一个中文字符前是单词，再剥掉末尾的词性，如 "account for v. 解释"
+ *   都没有   → 第一个空格前是单词（老规则） */
+static const char *split_entry(const char *line, char *word, size_t wc)
 {
 	const char *p = line;
 	while (*p == ' ' || *p == '\t') p++;
 	if (!*p) return NULL;
-	const char *e = p;
-	while (*e && *e != ' ' && *e != '\t') e++;
-	size_t len = (size_t)(e - p);
-	if (len + 1 > wc) len = wc - 1;
-	memcpy(word, p, len);
-	word[len] = 0;
-	while (*e == ' ' || *e == '\t') e++;
-	return (*e && word[0]) ? e : NULL;
+
+	const char *e  = strchr(p, '\t');
+	const char *zh = NULL;
+	if (!e) {
+		for (const char *q = p; *q;) {
+			uint32_t cp;
+			int n = utf8_decode((const unsigned char *)q, &cp);
+			if (is_zh_cp(cp)) { zh = q; break; }
+			q += n;
+		}
+	}
+	if (!e && zh) {
+		e = zh;
+		for (;;) {
+			while (e > p && is_sep(e[-1])) e--;
+			const char *t = e;
+			while (t > p && !is_sep(t[-1])) t--;
+			char tok[40];
+			if (t == p || pos_try(t, p, tok, sizeof tok) != (int)(e - t)) break;
+			e = t;   /* 末尾这个是词性，留给释义 */
+		}
+	}
+	if (!e) {
+		e = p;
+		while (*e && *e != ' ') e++;
+	}
+
+	const char *rest = e;
+	while (e > p && is_sep(e[-1])) e--;
+	copy_word(p, e, word, wc);
+	while (is_sep(*rest)) rest++;
+	return (*rest && word[0]) ? rest : NULL;
 }
 
 static bool exists_in(const Word *items, int n, const char *w)
@@ -316,7 +365,18 @@ void words_add_text(WordList *wl, const char *text, AddStat *st)
 		if (!c) any_ascii = true;
 	}
 
-	if (any_ascii) {
+	/* 交替式：英文一行、中文一行（从网页/词书复制常见这种） */
+	bool alternate = any_ascii && nl % 2 == 0;
+	for (int i = 0; alternate && i < nl; i++)
+		if (has_cjk(lines[i]) != (i % 2 == 1)) alternate = false;
+
+	if (alternate && nl > 2) {
+		for (int i = 0; i < nl; i += 2) {
+			char w[DICT_MAX_WORD];
+			copy_word(lines[i], lines[i] + strlen(lines[i]), w, sizeof w);
+			take(wl, items, &ni, st, w, lines[i + 1]);
+		}
+	} else if (any_ascii) {
 		/* 两段式：前 eng_n 行英文、后 zh_n 行中文 */
 		int eng_n = (first_cjk < 0) ? nl : first_cjk;
 		int zh_n  = nl - eng_n;
@@ -330,12 +390,16 @@ void words_add_text(WordList *wl, const char *text, AddStat *st)
 			snprintf(st->err, sizeof st->err, "英文 %d 个、中文 %d 行，数量不一致", eng_n, zh_n);
 			goto done;
 		}
-		for (int i = 0; i < eng_n; i++) take(wl, items, &ni, st, lines[i], lines[eng_n + i]);
+		for (int i = 0; i < eng_n; i++) {
+			char w[DICT_MAX_WORD];
+			copy_word(lines[i], lines[i] + strlen(lines[i]), w, sizeof w);
+			take(wl, items, &ni, st, w, lines[eng_n + i]);
+		}
 	} else {
-		/* 单行式：每行「单词 词性 释义」 */
+		/* 单行式：每行「单词/短语 词性 释义」 */
 		for (int i = 0; i < nl; i++) {
 			char w[DICT_MAX_WORD] = {0};
-			const char *rest = split_first_word(lines[i], w, sizeof w);
+			const char *rest = split_entry(lines[i], w, sizeof w);
 			if (!rest) { st->bad++; continue; }
 			take(wl, items, &ni, st, w, rest);
 		}

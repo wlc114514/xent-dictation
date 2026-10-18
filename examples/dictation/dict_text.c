@@ -4,6 +4,7 @@
  */
 #include "dict_text.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -161,16 +162,122 @@ bool meaning_match(const char *ans, const char *meaning)
 	return false;
 }
 
+
+/* ================================================================== */
+/* 一词多义：拆义项、逐条判                                            */
+/* ================================================================== */
+
+static bool is_open_cp(uint32_t cp)  { return cp == '(' || cp == '[' || cp == 0xFF08 /* （ */ || cp == 0x3010 /* 【 */; }
+static bool is_close_cp(uint32_t cp) { return cp == ')' || cp == ']' || cp == 0xFF09 /* ） */ || cp == 0x3011 /* 】 */; }
+
+/* 把 [p, e) 去掉首尾空白后作为一个义项收下（重复的不收） */
+static void sense_put(const char *p, const char *e, char out[][DICT_SENSE_LEN], int *n, int max)
+{
+	while (p < e && (*p == ' ' || *p == '\t')) p++;
+	while (e > p && (e[-1] == ' ' || e[-1] == '\t')) e--;
+	if (p == e || *n >= max) return;
+	size_t len = (size_t)(e - p);
+	if (len >= DICT_SENSE_LEN) len = DICT_SENSE_LEN - 1;
+	char s[DICT_SENSE_LEN];
+	memcpy(s, p, len);
+	s[len] = 0;
+	if (is_blank(s)) return;
+	for (int i = 0; i < *n; i++) if (strcmp(out[i], s) == 0) return;
+	memcpy(out[(*n)++], s, len + 1);
+}
+
+int split_senses(const char *meaning, char out[][DICT_SENSE_LEN], int max)
+{
+	int         n     = 0, depth = 0;
+	uint32_t    prev  = 0;   /* 上一个非空白字符 */
+	const char *start = meaning;
+	for (const char *p = meaning; *p;) {
+		uint32_t cp;
+		int      len = utf8_decode((const unsigned char *)p, &cp);
+		if (is_open_cp(cp)) depth++;
+		else if (is_close_cp(cp) && depth > 0) depth--;
+
+		bool split = false;
+		if (depth == 0 && is_sep(cp)) split = true;
+		if (depth == 0 && (cp == ' ' || cp == '\t') && is_cjk_cp(prev)) {
+			/* 空格只在两个汉字之间才算分隔：「复杂的 复合体」拆，「使 (决定) 转向」不拆 */
+			const char *q = p;
+			while (*q == ' ' || *q == '\t') q++;
+			uint32_t next = 0;
+			if (*q) utf8_decode((const unsigned char *)q, &next);
+			split = is_cjk_cp(next);
+		}
+		if (split) {
+			sense_put(start, p, out, &n, max);
+			start = p + len;
+		}
+		if (cp != ' ' && cp != '\t') prev = split ? 0 : cp;
+		p += len;
+	}
+	sense_put(start, start + strlen(start), out, &n, max);
+	return n;
+}
+
+int senses_mark(const char *ans, char senses[][DICT_SENSE_LEN], int ns, uint32_t *got)
+{
+	char parts[DICT_MAX_SENSES][DICT_SENSE_LEN];
+	int  np    = split_senses(ans, parts, DICT_MAX_SENSES);
+	int  fresh = 0;
+	for (int i = 0; i < np; i++) {
+		for (int k = 0; k < ns; k++) {
+			if (*got & (1u << k) || !meaning_match(parts[i], senses[k])) continue;
+			*got |= 1u << k;
+			fresh++;
+			break;
+		}
+	}
+	return fresh;
+}
+
+/* 规整成比对用的形式：小写、去掉 '.'、连续空白压成一个空格、去首尾 */
+static void answer_norm(const char *src, char *dst, size_t cap)
+{
+	size_t j  = 0;
+	bool   sp = false;
+	for (const char *p = src; *p && j + 2 < cap; p++) {
+		char c = *p;
+		if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { if (j > 0) sp = true; continue; }
+		if (c == '.') continue;
+		if (sp) { dst[j++] = ' '; sp = false; }
+		dst[j++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+	}
+	dst[j] = 0;
+}
+
+bool answer_eq(const char *ans, const char *word)
+{
+	char a[256], w[256];
+	answer_norm(ans, a, sizeof a);
+	answer_norm(word, w, sizeof w);
+	return a[0] && strcmp(a, w) == 0;
+}
+
 void masked_display(const char *word, char *out, size_t cap)
 {
-	size_t n    = strlen(word);
-	size_t hint = (n + 1) / 2;
-	size_t j    = 0;
-	if (hint > 0) hint -= 1;
-	for (size_t i = 0; i < n; i++) {
-		if (j + 3 >= cap) break;
-		if (i) out[j++] = ' ';
-		out[j++] = (i < hint) ? word[i] : '_';
+	size_t j = 0;
+	for (const char *p = word; *p;) {
+		while (*p == ' ') p++;
+		if (!*p) break;
+		const char *e = p;
+		while (*e && *e != ' ') e++;
+		if (j > 0 && j + 4 < cap) { memcpy(out + j, "   ", 3); j += 3; }   /* 短语：词与词之间留宽空 */
+
+		/* 每个词各自露出前半段；字母以外的字符（- ' /）原样显示 */
+		size_t n    = (size_t)(e - p);
+		size_t hint = (n + 1) / 2;
+		if (hint > 0) hint -= 1;
+		for (size_t i = 0; i < n; i++) {
+			if (j + 3 >= cap) break;
+			if (i) out[j++] = ' ';
+			bool letter = isalnum((unsigned char)p[i]) || (unsigned char)p[i] >= 0x80;
+			out[j++] = (i < hint || !letter) ? p[i] : '_';
+		}
+		p = e;
 	}
 	out[j] = 0;
 }

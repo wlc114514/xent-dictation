@@ -20,7 +20,9 @@
 
 struct Judge {
 	bool   enabled;
+	bool   api_judge;   /* "api": "judge" → 2B 判分服务（POST /judge）；否则 0.8B llama-server（/completion） */
 	char   exe[MAX_PATH * 3];
+	char   args[MAX_PATH * 3];   /* api_judge：exe 后面的参数（服务脚本等），端口和本进程号自动追加 */
 	char   model[MAX_PATH * 3];
 	char   host[64];
 	int    port;
@@ -31,6 +33,7 @@ struct Judge {
 	volatile LONG spawned;
 	volatile LONG warming;
 	HANDLE        proc;
+	HANDLE        job;   /* 拉起的整棵进程树（服务 → python → jev-score-v2）随本程序退出一起结束 */
 
 	struct { char meaning[640]; char ans[512]; double p; } cache[JUDGE_CACHE];
 	int cache_n;
@@ -64,8 +67,14 @@ Judge *judge_create(const char *cfg_path, void (*resolve)(const char *in, char *
 		if (t > 0) j->timeout_ms = (int)(t * 1000);
 	}
 	if ((p = json_find_key(buf, "exe")))   js_str(p, j->exe, sizeof j->exe);
+	if ((p = json_find_key(buf, "args")))  js_str(p, j->args, sizeof j->args);
 	if ((p = json_find_key(buf, "model"))) js_str(p, j->model, sizeof j->model);
 	if ((p = json_find_key(buf, "host")))  js_str(p, j->host, sizeof j->host);
+	if ((p = json_find_key(buf, "api"))) {
+		char api[16];
+		js_str(p, api, sizeof api);
+		j->api_judge = strcmp(api, "judge") == 0;
+	}
 	free(buf);
 
 	if (resolve) {
@@ -83,6 +92,7 @@ void judge_destroy(Judge *j)
 		TerminateProcess(j->proc, 0);
 		CloseHandle(j->proc);
 	}
+	if (j->job) CloseHandle(j->job);   /* KILL_ON_JOB_CLOSE：连同服务拉起的子进程一起结束 */
 	free(j);
 }
 
@@ -143,11 +153,23 @@ static void spawn_server(Judge *j)
 {
 	if (InterlockedCompareExchange(&j->spawned, 1, 0) != 0) return;
 
-	wchar_t wexe[MAX_PATH], wmodel[MAX_PATH], cmd[4096];
+	wchar_t wexe[MAX_PATH], wmodel[MAX_PATH], wargs[MAX_PATH * 3], cmd[4096];
 	MultiByteToWideChar(CP_UTF8, 0, j->exe, -1, wexe, MAX_PATH);
 	MultiByteToWideChar(CP_UTF8, 0, j->model, -1, wmodel, MAX_PATH);
-	_snwprintf(cmd, 4096, L"\"%ls\" -m \"%ls\" --host 127.0.0.1 --port %d -c 2048 -t 8 --no-webui",
-	           wexe, wmodel, j->port);
+	MultiByteToWideChar(CP_UTF8, 0, j->args, -1, wargs, MAX_PATH * 3);
+	if (j->api_judge)
+		_snwprintf(cmd, 4096, L"\"%ls\" %ls --port %d --parent-pid %lu", wexe, wargs, j->port, GetCurrentProcessId());
+	else
+		_snwprintf(cmd, 4096, L"\"%ls\" -m \"%ls\" --host 127.0.0.1 --port %d -c 2048 -t 8 --no-webui",
+		           wexe, wmodel, j->port);
+
+	/* 作业对象：本程序退出（哪怕崩溃）时，拉起的进程连同它的子进程一起结束 */
+	j->job = CreateJobObjectW(NULL, NULL);
+	if (j->job) {
+		JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
+		li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+		SetInformationJobObject(j->job, JobObjectExtendedLimitInformation, &li, sizeof li);
+	}
 
 	SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
 	HANDLE log = CreateFileW(L"jev\\server.log", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -162,7 +184,9 @@ static void spawn_server(Judge *j)
 		si.hStdError  = log;
 	}
 	PROCESS_INFORMATION pi = {0};
-	if (CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+	if (CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+		if (j->job) AssignProcessToJobObject(j->job, pi.hProcess);   /* 先入作业再运行，子进程自动跟着入 */
+		ResumeThread(pi.hThread);
 		j->proc = pi.hProcess;
 		CloseHandle(pi.hThread);
 	}
@@ -248,6 +272,22 @@ static bool jev_slot(const Judge *j, const char *meaning, const char *ans, int k
 	return true;
 }
 
+/* 2B 判分服务（JEV\v3-2b\jev2b_server.py）：POST /judge {"meaning","answer"} → {"p"}。
+ * 2B 要块注意力，llama-server 跑不了，题目拼装、分词和校准都在服务里按官方运行时做 */
+static bool judge_service(const Judge *j, const char *meaning, const char *ans, double *out)
+{
+	static char em[1024], ea[1024], body[2600], resp[1024];
+	json_escape(meaning, em, sizeof em);
+	json_escape(ans, ea, sizeof ea);
+	int n = snprintf(body, sizeof body, "{\"meaning\":\"%s\",\"answer\":\"%s\"}", em, ea);
+	if (n <= 0 || (size_t)n >= sizeof body) return false;
+	if (!http_request(j, L"POST", L"/judge", body, resp, sizeof resp, j->timeout_ms)) return false;
+	const char *p = json_find_key(resp, "p");
+	if (!p) return false;
+	*out = strtod(p, NULL);
+	return *out >= 0 && *out <= 1;
+}
+
 double judge_p(Judge *j, const char *meaning, const char *ans)
 {
 	if (!judge_enabled(j)) return -1;
@@ -261,12 +301,17 @@ double judge_p(Judge *j, const char *meaning, const char *ans)
 		if (strcmp(j->cache[i].meaning, meaning) == 0 && strcmp(j->cache[i].ans, ans) == 0)
 			return j->cache[i].p;
 
-	double d0, d1;
-	if (!jev_slot(j, meaning, ans, 0, &d0) || !jev_slot(j, meaning, ans, 1, &d1)) return -1;
-	double z = (d0 - d1) / JEV_TEMPERATURE;
-	if (z > 30.0)  z = 30.0;
-	if (z < -30.0) z = -30.0;
-	double p = 1.0 / (1.0 + exp(-z));
+	double p;
+	if (j->api_judge) {
+		if (!judge_service(j, meaning, ans, &p)) return -1;
+	} else {
+		double d0, d1;
+		if (!jev_slot(j, meaning, ans, 0, &d0) || !jev_slot(j, meaning, ans, 1, &d1)) return -1;
+		double z = (d0 - d1) / JEV_TEMPERATURE;
+		if (z > 30.0)  z = 30.0;
+		if (z < -30.0) z = -30.0;
+		p = 1.0 / (1.0 + exp(-z));
+	}
 
 	int slot = j->cache_n++ % JUDGE_CACHE;
 	snprintf(j->cache[slot].meaning, sizeof j->cache[slot].meaning, "%s", meaning);

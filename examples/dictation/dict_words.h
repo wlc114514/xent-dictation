@@ -37,7 +37,9 @@ bool words_load(WordList *wl, const char *path);
 
 /* 多行文本 → 追加进词表（内存 + 文件）。两种格式：
  *   ① 两段式：先全部英文单词（一行一个），再全部中文释义（一行一个），数量要一致
- *   ② 单行式：每行「单词 词性 释义」
+ *   ② 单行式：每行「单词 词性 释义」；单词可以是短语，到第一个中文字符为止
+ *     （末尾的词性归释义），也可以用 Tab / = / : / - 隔开，如 "account for v. 解释"
+ *   ③ 交替式：英文一行、中文一行
  * 已有的词（不分大小写）自动跳过。 */
 void words_add_text(WordList *wl, const char *text, AddStat *st);
 
