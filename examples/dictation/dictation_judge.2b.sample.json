@@ -5,6 +5,6 @@
   "args": "-I C:/path/to/JEV/v3-2b/jev2b_server.py",
   "host": "127.0.0.1",
   "port": 8088,
-  "threshold": 0.9,
+  "threshold": 0.8,
   "timeout_s": 15
 }
