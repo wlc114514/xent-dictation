@@ -18,11 +18,17 @@
 #define JEV_TOKEN_NO    874
 #define JUDGE_CACHE     8
 
+typedef enum JudgeApi {
+	API_COMPLETION = 0,   /* 不写 "api"：0.8B llama-server（/completion） */
+	API_JUDGE,            /* "api": "judge" → 2B 判分服务（POST /judge） */
+	API_SYSTEMONE,        /* "api": "systemone" → 新版 llama-server 的 /v1/systemone（vllm-d3-nano 等决策模型） */
+} JudgeApi;
+
 struct Judge {
-	bool   enabled;
-	bool   api_judge;   /* "api": "judge" → 2B 判分服务（POST /judge）；否则 0.8B llama-server（/completion） */
+	bool     enabled;
+	JudgeApi api;
 	char   exe[MAX_PATH * 3];
-	char   args[MAX_PATH * 3];   /* api_judge：exe 后面的参数（服务脚本等），端口和本进程号自动追加 */
+	char   args[MAX_PATH * 3];   /* API_JUDGE：exe 后面的参数（服务脚本等），端口和本进程号自动追加；API_SYSTEMONE：追加到 llama-server 命令行末尾 */
 	char   model[MAX_PATH * 3];
 	char   host[64];
 	int    port;
@@ -73,7 +79,8 @@ Judge *judge_create(const char *cfg_path, void (*resolve)(const char *in, char *
 	if ((p = json_find_key(buf, "api"))) {
 		char api[16];
 		js_str(p, api, sizeof api);
-		j->api_judge = strcmp(api, "judge") == 0;
+		if (strcmp(api, "judge") == 0)          j->api = API_JUDGE;
+		else if (strcmp(api, "systemone") == 0) j->api = API_SYSTEMONE;
 	}
 	free(buf);
 
@@ -157,8 +164,11 @@ static void spawn_server(Judge *j)
 	MultiByteToWideChar(CP_UTF8, 0, j->exe, -1, wexe, MAX_PATH);
 	MultiByteToWideChar(CP_UTF8, 0, j->model, -1, wmodel, MAX_PATH);
 	MultiByteToWideChar(CP_UTF8, 0, j->args, -1, wargs, MAX_PATH * 3);
-	if (j->api_judge)
+	if (j->api == API_JUDGE)
 		_snwprintf(cmd, 4096, L"\"%ls\" %ls --port %d --parent-pid %lu", wexe, wargs, j->port, GetCurrentProcessId());
+	else if (j->api == API_SYSTEMONE)   /* -ngl 99：有显卡就全放上去，没有自动回落 CPU */
+		_snwprintf(cmd, 4096, L"\"%ls\" -m \"%ls\" --host 127.0.0.1 --port %d -c 2048 -ngl 99 --no-webui %ls",
+		           wexe, wmodel, j->port, wargs);
 	else
 		_snwprintf(cmd, 4096, L"\"%ls\" -m \"%ls\" --host 127.0.0.1 --port %d -c 2048 -t 8 --no-webui",
 		           wexe, wmodel, j->port);
@@ -288,6 +298,28 @@ static bool judge_service(const Judge *j, const char *meaning, const char *ans, 
 	return *out >= 0 && *out <= 1;
 }
 
+/* 决策模型（llama.cpp /v1/systemone）：同一道「一致 / 不一致」选择题，取「一致」的概率。
+ * 返回 {"answers":{"q":{"probabilities":{"一致":0.83,"不一致":0.17},...}}}，中文键名原样输出 */
+static bool judge_systemone(const Judge *j, const char *meaning, const char *ans, double *out)
+{
+	static char em[1024], ea[1024], body[3200], resp[4096];
+	json_escape(meaning, em, sizeof em);
+	json_escape(ans, ea, sizeof ea);
+	int n = snprintf(body, sizeof body,
+	    "{\"state\":\"标准释义：%s\\n学生写的释义：%s\",\"questions\":{\"q\":{\"type\":\"choice\","
+	    "\"instructions\":\"学生写的释义与标准释义表达的意思是否一致？\","
+	    "\"criteria\":{\"一致\":\"意思相同或非常接近\",\"不一致\":\"意思不同或无关\"}}}}", em, ea);
+	if (n <= 0 || (size_t)n >= sizeof body) return false;
+	if (!http_request(j, L"POST", L"/v1/systemone", body, resp, sizeof resp, j->timeout_ms)) return false;
+	const char *p = strstr(resp, "\"probabilities\"");
+	if (p) p = strstr(p, "\"一致\"");   /* 带引号找，不会撞上「不一致」 */
+	if (!p) return false;
+	p = skip_ws(p + strlen("\"一致\""));
+	if (*p != ':') return false;
+	*out = strtod(p + 1, NULL);
+	return *out >= 0 && *out <= 1;
+}
+
 double judge_p(Judge *j, const char *meaning, const char *ans)
 {
 	if (!judge_enabled(j)) return -1;
@@ -302,8 +334,10 @@ double judge_p(Judge *j, const char *meaning, const char *ans)
 			return j->cache[i].p;
 
 	double p;
-	if (j->api_judge) {
+	if (j->api == API_JUDGE) {
 		if (!judge_service(j, meaning, ans, &p)) return -1;
+	} else if (j->api == API_SYSTEMONE) {
+		if (!judge_systemone(j, meaning, ans, &p)) return -1;
 	} else {
 		double d0, d1;
 		if (!jev_slot(j, meaning, ans, 0, &d0) || !jev_slot(j, meaning, ans, 1, &d1)) return -1;

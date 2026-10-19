@@ -6,7 +6,10 @@
  * 取 " yes"(id 9542) / " no"(id 874) 两个 token 的 logprob 差，
  * 按校准温度换算成「意思接近」的概率（与 Python 版同算法）。
  *
- * 配置文件 dictation_judge.json：enabled/exe/model/host/port/threshold/timeout_s。
+ * 另有两种后端（"api" 字段）："judge" = 2B 判分服务 POST /judge；
+ * "systemone" = 新版 llama-server 的 /v1/systemone（vllm-d3-nano 等决策模型），取「一致」选项的概率。
+ *
+ * 配置文件 dictation_judge.json：enabled/exe/model/host/port/threshold/timeout_s/api/args。
  * 没有配置文件 = 关闭，只用字面判分。
  */
 #pragma once

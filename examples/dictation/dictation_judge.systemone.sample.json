@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "api": "systemone",
+  "exe": "C:/path/to/llama.cpp/llama-server.exe",
+  "model": "C:/path/to/vllm-d3-nano-Q8_0.gguf",
+  "host": "127.0.0.1",
+  "port": 8089,
+  "threshold": 0.65,
+  "timeout_s": 15
+}

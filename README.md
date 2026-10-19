@@ -46,7 +46,7 @@ xmake build dictation
 使用 dictation_extra.json 保存词表，格式为 [["word","pos","meaning"], ...]。
 dictation_judge.json 配置可选的本地判分器。仓库提供 *.sample.json 示例，复制并去掉 .sample 后使用。
 
-判分器有两种（`api` 字段）：
+判分器有三种（`api` 字段），推荐 `systemone` + vllm-d3-nano：
 - 不写：0.8B（Jev-Style-0.8B-Decision-v3），程序拉起 llama-server，过线 0.9。
 - `"api": "judge"`：2B（Jev-Style-2B-Decision-v3），更准（尤其不会把「严肃的」判成「严酷的」），约 0.4 秒一次、占内存约 2.3GB。
   2B 要块注意力，llama-server 跑不了，要用作者的打分程序 jev-score-v2（对着 llama.cpp 441df11f 编译）和官方 Python 运行时；
@@ -54,6 +54,11 @@ dictation_judge.json 配置可选的本地判分器。仓库提供 *.sample.json
   服务把 2B 的原始概率在对数几率上平移，原始 0.55 映射成 0.9（`--pass-at`），所以过线和 0.8B 一样写 0.9；映射是单调的，等于原始分过线 0.55（在 170 组标注释义对上扫出来的）。
   示例配置把 2B 的过线降到 0.8（约等于原始分 0.35）：0.9 会把「精神/灵魂」「有害的/不利的」「身份/同一性」这类同义词判错（0.85–0.89），而「严肃的/严酷的」「合法的/合理的」在 0.78–0.80，0.8 仍能挡住。
   程序退出时连同服务和打分程序一起结束（作业对象）。
+- `"api": "systemone"`：llama.cpp 新版（b11361 起）`/v1/systemone` 接口上的决策模型，程序拉起 llama-server（`-ngl 99`，有显卡就用）。
+  推荐 [vllm-d3-nano](https://huggingface.co/ggml-org/vllm-d3-nano-GGUF)（Qwen3.5-2B，Q8_0 2.55GB），按 `dictation_judge.systemone.sample.json` 配置，过线 0.65（原始概率，0.6–0.7 都差不多）。
+  87 组中文释义对（42 组应判对、45 组应判错，含形近词、反义词）上各取最佳阈值的平衡准确率：
+  vllm-d3-nano 0.965、d1-3B 0.931、2B 0.920、lev 0.897、0.8B 0.839、Laya 0.667。
+  vllm-d3-nano 能放过「错觉/幻觉」（两个方向 0.83/0.97），又挡住「严肃的/严酷的」（0.55/0.30）；0.8B 和 2B 只能顾一头。RTX 5060 上约 25ms 一次，纯 CPU 约 0.25 秒。
 
 答案里写了几项（、，; 隔开）时逐项判，一项只顶一个义项。
 
