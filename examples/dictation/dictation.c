@@ -365,6 +365,61 @@ static void settings_load(App *a)
 	free(buf);
 }
 
+/* 练习进度存档 dictation_progress.bin：两套练习的出题状态 + 统计，重开程序接着做。
+ * 本机自用，直接存结构体；Session 结构一改 sizeof 就对不上，旧档作废、从头开始 */
+#define PROGRESS_MAGIC 0x31505844u   /* "DXP1" */
+
+typedef struct ProgressFile {
+	uint32_t magic;
+	uint32_t session_size;   /* sizeof(Session)：结构变了就不认 */
+	int32_t  nwords;         /* 存档时的词数：之后加了词按 sess_words_changed 补进去 */
+	int32_t  dir;
+	struct { Session s; int32_t answered, correct; } drill[2];
+} ProgressFile;
+
+static char g_progress_path[MAX_PATH * 3];
+
+static void progress_save(const App *a)
+{
+	if (!g_progress_path[0]) return;
+	static ProgressFile pf;
+	pf.magic        = PROGRESS_MAGIC;
+	pf.session_size = (uint32_t)sizeof(Session);
+	pf.nwords       = a->wl.n;
+	pf.dir          = (int32_t)a->dir;
+	for (int i = 0; i < 2; i++) {
+		pf.drill[i].s        = a->drill[i].s;
+		pf.drill[i].answered = a->drill[i].answered;
+		pf.drill[i].correct  = a->drill[i].correct;
+	}
+	FILE *f = u8_fopen(g_progress_path, "wb");
+	if (!f) return;
+	fwrite(&pf, sizeof pf, 1, f);
+	fclose(f);
+}
+
+/* 词表只会追加或清空：存档词数比现在多（换了词表）就不认 */
+static void progress_load(App *a)
+{
+	long  sz  = 0;
+	char *buf = read_file(g_progress_path, &sz);
+	if (!buf) return;
+	const ProgressFile *pf = (const ProgressFile *)buf;
+	if (sz == (long)sizeof *pf && pf->magic == PROGRESS_MAGIC && pf->session_size == sizeof(Session) &&
+	    pf->nwords > 0 && pf->nwords <= a->wl.n && (pf->dir == DIR_CN2EN || pf->dir == DIR_EN2CN)) {
+		a->dir = (Dir)pf->dir;
+		for (int i = 0; i < 2; i++) {
+			Drill *d    = &a->drill[i];
+			d->s        = pf->drill[i].s;
+			d->answered = pf->drill[i].answered;
+			d->correct  = pf->drill[i].correct;
+			if (d->s.phase == SP_CORRECT || d->s.phase == SP_REVEALED) sess_next(&d->s);   /* 上次答完没点「下一个」：直接到下一题 */
+			if (pf->nwords != a->wl.n) sess_words_changed(&d->s, a->wl.n);
+		}
+	}
+	free(buf);
+}
+
 static void settings_save(const App *a)
 {
 	FILE *f = u8_fopen(a->settings_path, "wb");
@@ -700,6 +755,7 @@ static void update(void *model, XtkMsg msg)
 	case MSG_MERGE_DONE:    if (msg.ptr) on_merge_done(a, (MergeJob *)msg.ptr); break;
 	default: break;
 	}
+	if (msg.tag != MSG_ANSWER && msg.tag != MSG_MERGE_PROGRESS) progress_save(a);   /* 打字不存，其余每步都存：崩了也不丢 */
 }
 
 /* ================================================================== */
@@ -934,6 +990,8 @@ static void app_init(App *a, const char *words_path, const char *judge_path)
 	sess_seed(&a->drill[1].s, seed ^ 0xA5A5A5A5DEADBEEFull);
 	sess_start_rounds(&a->drill[0].s, a->wl.n);
 	sess_start_endless(&a->drill[1].s, a->wl.n);   /* 无尽模式随时可进，进度独立保存 */
+	resolve_path("dictation_progress.bin", g_progress_path, (int)sizeof g_progress_path);
+	progress_load(a);   /* 上次的进度（没有存档就是从头开始） */
 }
 
 #ifndef DICT_LAYOUT_TEST
@@ -1040,6 +1098,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int showCmd)
 	};
 	int rc = app_run(&cfg, a);
 
+	progress_save(a);
 	InterlockedExchange(&g_quit, 1);
 	judge_destroy(a->judge);
 	return rc;

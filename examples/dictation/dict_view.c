@@ -361,7 +361,7 @@ static XtkEl *view_help(XtkUi *ui)
 {
 	return scroll_page(ui, PAGE_HELP, xtk_column(ui, (XtkStackDesc){.gap = 16, .align = XENT_FLEX_ALIGN_STRETCH},
 	    xtk_kids(
-	        page_header(ui, "说明", "两种练习各自保留进度，在左侧随时切换。", NULL),
+	        page_header(ui, "说明", "两种练习各自保留进度，在左侧随时切换；关掉程序再打开会接着上次的进度。", NULL),
 	        section(ui, "默写", NULL, para(ui,
 	            "第 1 轮按词表顺序出全部词。答错可以再试；点「不知道」或「跳过」会公布答案，这个词记为错词。\n"
 	            "一轮结束后先看错词清单，下一轮只默错的词，直到全部答对。")),

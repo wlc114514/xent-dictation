@@ -8,3 +8,4 @@ build/
 dictation_extra.json
 dictation_judge.json
 dictation_settings.json
+dictation_progress.bin
