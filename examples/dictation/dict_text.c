@@ -234,6 +234,43 @@ int senses_mark(const char *ans, char senses[][DICT_SENSE_LEN], int ns, uint32_t
 	return fresh;
 }
 
+bool senses_merge(char senses[][DICT_SENSE_LEN], int ns, const uint32_t *link, char *out, size_t cap)
+{
+	int root[DICT_MAX_SENSES];
+	for (int i = 0; i < ns; i++) root[i] = i;
+	bool any = false;
+	for (int i = 0; i < ns; i++) {
+		for (int j = i + 1; j < ns; j++) {
+			if (!(link[i] & (1u << j)) && !(link[j] & (1u << i))) continue;
+			int a = i, b = j;
+			while (root[a] != a) a = root[a];
+			while (root[b] != b) b = root[b];
+			if (a == b) continue;
+			if (a < b) root[b] = a; else root[a] = b;   /* 组以最靠前的一条为首 */
+			any = true;
+		}
+	}
+	if (!any) return false;
+
+	size_t j = 0;
+	out[0]   = 0;
+	for (int i = 0; i < ns && j < cap; i++) {
+		int r = i;
+		while (root[r] != r) r = root[r];
+		if (r != i) continue;   /* 不是组首：跟着组首写 */
+		j += (size_t)snprintf(out + j, cap - j, "%s%s", j ? "、" : "", senses[i]);
+		int more = 0;
+		for (int k = i + 1; k < ns && j < cap; k++) {
+			int rk = k;
+			while (root[rk] != rk) rk = root[rk];
+			if (rk != i) continue;
+			j += (size_t)snprintf(out + j, cap - j, "%s%s", more++ ? "、" : "（", senses[k]);
+		}
+		if (more && j < cap) j += (size_t)snprintf(out + j, cap - j, "）");
+	}
+	return true;
+}
+
 /* 规整成比对用的形式：小写、去掉 '.'、连续空白压成一个空格、去首尾 */
 static void answer_norm(const char *src, char *dst, size_t cap)
 {

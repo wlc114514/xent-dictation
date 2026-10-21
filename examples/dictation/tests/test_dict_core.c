@@ -118,6 +118,25 @@ static void test_text(void)
 	got = 0;
 	CHECK(senses_mark("发展，复杂的 详尽的", sn, ns, &got) == 3, "一次写多个：got=%u", got);
 
+	CASE("一词多义 · 合并同义义项");
+	char     merged[DICT_MAX_MEANING];
+	uint32_t link[DICT_MAX_SENSES] = {0};
+	ns = split_senses("标志、目标、标记、记号", sn, DICT_MAX_SENSES);
+	CHECK(!senses_merge(sn, ns, link, merged, sizeof merged), "没有同义的不改");
+	link[0] = 1u << 2;   /* 标志≈标记 */
+	link[2] = 1u << 3;   /* 标记≈记号 → 连通，三条合一 */
+	CHECK(senses_merge(sn, ns, link, merged, sizeof merged) && !strcmp(merged, "标志（标记、记号）、目标"), "[%s]", merged);
+	ns  = split_senses(merged, sn, DICT_MAX_SENSES);
+	got = 0;
+	CHECK(ns == 2, "合并后只剩 2 项：ns=%d", ns);
+	CHECK(senses_mark("记号", sn, ns, &got) == 1 && got == 1u, "写组里任何一条都算：got=%u", got);
+	CHECK(senses_mark("标志", sn, ns, &got) == 0, "同一组不重复计");
+	CHECK(senses_mark("目标", sn, ns, &got) == 1 && got == 3u, "got=%u", got);
+	memset(link, 0, sizeof link);
+	ns = split_senses("缓解、救济、减轻", sn, DICT_MAX_SENSES);
+	link[2] = 1u << 0;   /* 只在后一条上标也算 */
+	CHECK(senses_merge(sn, ns, link, merged, sizeof merged) && !strcmp(merged, "缓解（减轻）、救济"), "保持先后顺序：[%s]", merged);
+
 	CASE("其它工具");
 	CHECK(str_ci_eq("Equity", "equity"), "大小写不敏感");
 	CHECK(!str_ci_eq("equit", "equity"), "长度不同");
@@ -197,6 +216,12 @@ static void test_words(void)
 	CHECK(strcmp(again.words[0].word, "zeal") == 0 && strcmp(again.words[12].word, "turn down") == 0,
 	      "首=%s 尾=%s", again.words[0].word, again.words[12].word);
 	CHECK(strcmp(again.words[10].meaning, "屈服；让步") == 0, "释义=%s", again.words[10].meaning);
+
+	CASE("改释义后整表写回");
+	snprintf(WL.words[0].meaning, sizeof WL.words[0].meaning, "热情（热心）");
+	CHECK(words_save(&WL), "写回失败");
+	CHECK(words_load(&again, path) && again.n == 13 && !strcmp(again.words[0].meaning, "热情（热心）")
+	      && !strcmp(again.words[1].meaning, "公正 [法]"), "n=%d [%s]", again.n, again.words[0].meaning);
 
 	CASE("清空");
 	words_clear(&WL);

@@ -24,9 +24,11 @@ void   judge_destroy(Judge *j);   /* 会结束本程序拉起的 llama-server */
 
 bool   judge_enabled(const Judge *j);
 double judge_threshold(const Judge *j);
+/* 一词多义合并的阈值（双向都大于它才合并）；0 = 不做合并（"merge_threshold"，systemone 默认 0.98，其余默认 0） */
+double judge_merge_threshold(const Judge *j);
 
 /* 后台预热：服务没起就拉起来并等它就绪（不阻塞调用方） */
 void   judge_warmup(Judge *j);
 
-/* 「意思接近」概率 0–1；服务不可用返回 -1 */
+/* 「意思接近」概率 0–1；服务不可用返回 -1。线程安全（内部加锁，同一时刻只发一个请求） */
 double judge_p(Judge *j, const char *meaning, const char *ans);

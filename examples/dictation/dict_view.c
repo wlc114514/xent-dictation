@@ -334,7 +334,13 @@ static XtkEl *view_library(XtkUi *ui, App *a)
 	        xtk_row(ui, (XtkStackDesc){.gap = 8},
 	            xtk_kids(
 	                xtk_button(ui, "打开输入窗口", (XtkButtonDesc){.style = XTK_BUTTON_ACCENT, .icon = "Add", .click = xtk_msg(MSG_ADD_DIALOG)}),
-	                xtk_button(ui, "从剪贴板导入", (XtkButtonDesc){.icon = "Paste", .click = xtk_msg(MSG_ADD_CLIP)})))),
+	                xtk_button(ui, "从剪贴板导入", (XtkButtonDesc){.icon = "Paste", .click = xtk_msg(MSG_ADD_CLIP)}),
+	                judge_merge_threshold(a->judge) > 0
+	                    ? xtk_tooltip(ui,
+	                          xtk_button(ui, a->merging ? "正在检查…" : "合并同义释义",
+	                                     (XtkButtonDesc){.icon = "Link", .disabled = a->merging || a->wl.n == 0, .click = xtk_msg(MSG_MERGE_ALL)}),
+	                          "用智能判分检查整个词库：一词多义里意思相同的释义合并成一项")
+	                    : NULL))),
 	    xtk_grow(xtk_card(ui, (XtkStackDesc){.gap = 8, .padding = {20, 18, 20, 12}, .align = XENT_FLEX_ALIGN_STRETCH, .fill = true},
 	        xtk_kids(
 	            subtitle(ui, "全部单词"),
@@ -368,6 +374,8 @@ static XtkEl *view_help(XtkUi *ui)
 	            "单词 → 释义：看英文写中文。有多个意思的词（释义里用 、 ; 或空格隔开）要把每个意思都写出来："
 	            "一次写一个，也可以一次写几个用 、 隔开；答出的会打勾，全部答出才算对，括号里的注释不用写。"
 	            "右上角取消勾选「多义词全答」后，写出任意一个意思就算对（开关会记住）。"
+	            "录入新词时，一词多义里意思相同的释义（如「缓解、减轻」）会用智能判分自动合并成「缓解（减轻）」，写其中任何一个都算答对这一项；"
+	            "已有的词库可以在词库页点「合并同义释义」。"
 	            "字面判不出时，会请本地小模型判断意思是否接近。\n"
 	            "短语按整条比对：不分大小写，多余的空格和 sth. 的点号不计较。")),
 	        section(ui, "快捷键", NULL, para(ui, "输入框里按回车 = 提交；答完后按回车 = 下一个（无尽模式里是重新开始本组）。")))));

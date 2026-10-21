@@ -130,6 +130,22 @@ static bool append_to_file(const char *path, const Word *items, int n)
 	return ok;
 }
 
+bool words_save(const WordList *wl)
+{
+	FILE *f = u8_fopen(wl->path, "wb");
+	if (!f) return false;
+	fputs("[\n", f);
+	for (int i = 0; i < wl->n; i++) {
+		char w[DICT_MAX_WORD * 7], ps[DICT_MAX_POS * 7], mn[DICT_MAX_MEANING * 7];
+		json_escape(wl->words[i].word, w, sizeof w);
+		json_escape(wl->words[i].pos, ps, sizeof ps);
+		json_escape(wl->words[i].meaning, mn, sizeof mn);
+		fprintf(f, "  [\"%s\", \"%s\", \"%s\"]%s\n", w, ps, mn, (i + 1 < wl->n) ? "," : "");
+	}
+	fputs("]\n", f);
+	return fclose(f) == 0;
+}
+
 void words_clear(WordList *wl)
 {
 	if (wl->path[0]) u8_remove(wl->path);

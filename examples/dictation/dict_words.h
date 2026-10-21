@@ -43,6 +43,9 @@ bool words_load(WordList *wl, const char *path);
  * 已有的词（不分大小写）自动跳过。 */
 void words_add_text(WordList *wl, const char *text, AddStat *st);
 
+/* 整个词表按标准格式写回文件（改了释义后用；手写的排版不保留） */
+bool words_save(const WordList *wl);
+
 /* 清空：删除词表文件、内存清零 */
 void words_clear(WordList *wl);
 

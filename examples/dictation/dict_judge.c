@@ -33,7 +33,10 @@ struct Judge {
 	char   host[64];
 	int    port;
 	double threshold;
+	double merge_threshold;   /* 一词多义里两条释义双向都大于它才合并；0 = 不合并 */
 	int    timeout_ms;
+
+	CRITICAL_SECTION lock;   /* 答题判分和合并检查各在自己的后台线程里调 judge_p */
 
 	volatile LONG ready;
 	volatile LONG spawned;
@@ -59,6 +62,7 @@ Judge *judge_create(const char *cfg_path, void (*resolve)(const char *in, char *
 	j->port       = 8087;
 	j->threshold  = 0.9;
 	j->timeout_ms = 15000;
+	InitializeCriticalSection(&j->lock);
 
 	char *buf = read_file(cfg_path, NULL);
 	if (!buf) return j;                       /* 没有配置文件 → 关闭 */
@@ -82,6 +86,10 @@ Judge *judge_create(const char *cfg_path, void (*resolve)(const char *in, char *
 		if (strcmp(api, "judge") == 0)          j->api = API_JUDGE;
 		else if (strcmp(api, "systemone") == 0) j->api = API_SYSTEMONE;
 	}
+	/* 合并要宁缺毋滥：0.98 是 vllm-d3-nano 在 268 对标注释义上测的（错合并 3/120，同义合并 137/148）；
+	 * 别的模型没测过，不写就不合并 */
+	j->merge_threshold = j->api == API_SYSTEMONE ? 0.98 : 0;
+	if ((p = json_find_key(buf, "merge_threshold"))) j->merge_threshold = strtod(p, NULL);
 	free(buf);
 
 	if (resolve) {
@@ -100,11 +108,13 @@ void judge_destroy(Judge *j)
 		CloseHandle(j->proc);
 	}
 	if (j->job) CloseHandle(j->job);   /* KILL_ON_JOB_CLOSE：连同服务拉起的子进程一起结束 */
+	DeleteCriticalSection(&j->lock);
 	free(j);
 }
 
 bool   judge_enabled(const Judge *j)   { return j && j->enabled; }
 double judge_threshold(const Judge *j) { return j ? j->threshold : 1.0; }
+double judge_merge_threshold(const Judge *j) { return judge_enabled(j) ? j->merge_threshold : 0; }
 
 /* ================================================================== */
 /* HTTP                                                                */
@@ -320,9 +330,8 @@ static bool judge_systemone(const Judge *j, const char *meaning, const char *ans
 	return *out >= 0 && *out <= 1;
 }
 
-double judge_p(Judge *j, const char *meaning, const char *ans)
+static double judge_p_unlocked(Judge *j, const char *meaning, const char *ans)
 {
-	if (!judge_enabled(j)) return -1;
 	if (!j->ready) {
 		if (!server_health(j)) { judge_warmup(j); return -1; }
 		InterlockedExchange(&j->ready, 1);
@@ -351,5 +360,14 @@ double judge_p(Judge *j, const char *meaning, const char *ans)
 	snprintf(j->cache[slot].meaning, sizeof j->cache[slot].meaning, "%s", meaning);
 	snprintf(j->cache[slot].ans, sizeof j->cache[slot].ans, "%s", ans);
 	j->cache[slot].p = p;
+	return p;
+}
+
+double judge_p(Judge *j, const char *meaning, const char *ans)
+{
+	if (!judge_enabled(j)) return -1;
+	EnterCriticalSection(&j->lock);   /* 请求缓冲和结果缓存都是共用的 */
+	double p = judge_p_unlocked(j, meaning, ans);
+	LeaveCriticalSection(&j->lock);
 	return p;
 }

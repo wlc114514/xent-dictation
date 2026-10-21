@@ -110,6 +110,7 @@ static const char *answer_text(const App *a, int idx, char *buf, size_t cap)
 
 #define WM_BRIDGE_JUDGED (WM_APP + 1)
 #define WM_BRIDGE_POST   (WM_APP + 2)
+#define WM_BRIDGE_MERGE  (WM_APP + 3)   /* wp = 消息号；进度：lp 高 32 位已查、低 32 位总数；结束：lp = MergeJob* */
 
 static LRESULT CALLBACK bridge_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -122,6 +123,11 @@ static LRESULT CALLBACK bridge_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 	}
 	if (msg == WM_BRIDGE_POST) {
 		xtk_rt_post(g_rt, (XtkMsg){.tag = (int32_t)wp});
+		return 0;
+	}
+	if (msg == WM_BRIDGE_MERGE) {
+		if (wp == MSG_MERGE_DONE) xtk_rt_post(g_rt, (XtkMsg){.tag = MSG_MERGE_DONE, .ptr = (void *)lp});
+		else xtk_rt_post(g_rt, (XtkMsg){.tag = MSG_MERGE_PROGRESS, .i = (int32_t)((uint64_t)lp >> 32), .f = (float)(uint32_t)lp});
 		return 0;
 	}
 	return DefWindowProcW(h, msg, wp, lp);
@@ -443,9 +449,165 @@ static void words_changed(App *a)
 	for (int i = 0; i < 2; i++) sess_words_changed(&a->drill[i].s, a->wl.n);
 }
 
+/* ================================================================== */
+/* 一词多义：合并意思相同的释义（后台线程问模型）                      */
+/* ================================================================== */
+
+/* 「缓解、减轻」这种：分开考就得把同一个意思写两遍。两条释义双向都过 judge_merge_threshold 才合并，
+ * 宁可不合并也不错合并。只改释义文字（「缓解（减轻）」），写组里任何一条都算答对这一项 */
+typedef struct MergeItem {
+	char word[DICT_MAX_WORD];
+	char meaning[DICT_MAX_MEANING];   /* 检查时的释义：结果回来时词库里已经改了就不动 */
+	char merged[DICT_MAX_MEANING];    /* 合并后的释义；空 = 不用改 */
+} MergeItem;
+
+typedef struct MergeJob {
+	Judge    *judge;
+	double    threshold;
+	bool      failed;      /* 模型没起来 / 中途断开：已查完的词照样合并 */
+	char      intro[400];  /* 导入后自动检查时，先接着显示导入结果 */
+	int       n;
+	MergeItem items[];
+} MergeJob;
+
+static volatile LONG g_quit;   /* 程序退出：合并线程别再发请求 */
+
+static void merge_post_progress(int done, int total)
+{
+	PostMessageW(g_bridge, WM_BRIDGE_MERGE, MSG_MERGE_PROGRESS, (LPARAM)(((uint64_t)done << 32) | (uint32_t)total));
+}
+
+static DWORD WINAPI merge_thread(LPVOID param)
+{
+	MergeJob *job = (MergeJob *)param;
+	char      sn[DICT_MAX_SENSES][DICT_SENSE_LEN];
+	int       total = 0, done = 0;
+	for (int w = 0; w < job->n; w++) {
+		int ns = split_senses(job->items[w].meaning, sn, DICT_MAX_SENSES);
+		total += ns * (ns - 1) / 2;
+	}
+	merge_post_progress(0, total);
+
+	/* 服务还没起：拉起来等它就绪（最多约 60 秒） */
+	bool ready = false;
+	for (int i = 0; i < 240 && !g_quit && !(ready = judge_p(job->judge, "取代", "代替") >= 0); i++) Sleep(250);
+	if (!ready) { job->failed = true; goto out; }
+
+	for (int w = 0; w < job->n && !job->failed; w++) {
+		MergeItem *it = &job->items[w];
+		int        ns = split_senses(it->meaning, sn, DICT_MAX_SENSES);
+		uint32_t   link[DICT_MAX_SENSES] = {0};
+		for (int i = 0; i < ns && !job->failed; i++) {
+			for (int k = i + 1; k < ns; k++) {
+				merge_post_progress(++done, total);
+				double p = g_quit ? -1 : judge_p(job->judge, sn[i], sn[k]);
+				double q = p > job->threshold ? judge_p(job->judge, sn[k], sn[i]) : p;   /* 单向就不够的，不用再问反向 */
+				if (p < 0 || q < 0) { job->failed = true; break; }
+				if (p > job->threshold && q > job->threshold) link[i] |= 1u << k;
+			}
+		}
+		if (!job->failed && !senses_merge(sn, ns, link, it->merged, sizeof it->merged)) it->merged[0] = 0;
+	}
+out:
+	PostMessageW(g_bridge, WM_BRIDGE_MERGE, MSG_MERGE_DONE, (LPARAM)job);
+	return 0;
+}
+
+/* 检查词表 [from, to) 里的多义词；intro 非空 = 导入后自动检查。没有多义词 / 没配合并 / 正在查 → 返回 false */
+static bool start_merge(App *a, int from, int to, const char *intro)
+{
+	double thr = judge_merge_threshold(a->judge);
+	if (thr <= 0 || a->merging || !g_bridge) return false;
+	char sn[DICT_MAX_SENSES][DICT_SENSE_LEN];
+	int  n = 0;
+	for (int i = from; i < to; i++) n += split_senses(a->wl.words[i].meaning, sn, DICT_MAX_SENSES) > 1;
+	if (n == 0) return false;
+
+	MergeJob *job = (MergeJob *)calloc(1, sizeof *job + sizeof(MergeItem) * (size_t)n);
+	if (!job) return false;
+	job->judge     = a->judge;
+	job->threshold = thr;
+	snprintf(job->intro, sizeof job->intro, "%s", intro ? intro : "");
+	for (int i = from; i < to; i++) {
+		const Word *w = &a->wl.words[i];
+		if (split_senses(w->meaning, sn, DICT_MAX_SENSES) < 2) continue;
+		MergeItem *it = &job->items[job->n++];
+		snprintf(it->word, sizeof it->word, "%s", w->word);
+		snprintf(it->meaning, sizeof it->meaning, "%s", w->meaning);
+	}
+	HANDLE h = CreateThread(NULL, 0, merge_thread, job, 0, NULL);
+	if (!h) { free(job); return false; }
+	CloseHandle(h);
+	a->merging = true;
+	fb_set(&a->add_fb, XTK_INFOBAR_INFORMATIONAL, "正在检查一词多义…", "%s%s用智能判分检查 %d 个多义词里有没有意思相同的释义。",
+	       job->intro, job->intro[0] ? "\n" : "", job->n);
+	return true;
+}
+
+static void on_merge_progress(App *a, int done, int total)
+{
+	if (!a->merging) return;
+	snprintf(a->add_fb.title, sizeof a->add_fb.title, "正在检查一词多义：%d / %d", done, total);
+}
+
+static void on_merge_done(App *a, MergeJob *job)
+{
+	static bool changed[DICT_MAX_WORDS];
+	memset(changed, 0, sizeof changed);
+	a->merging = false;
+
+	int    applied = 0;
+	char   list[600];
+	size_t j = 0;
+	list[0]  = 0;
+	for (int k = 0; k < job->n; k++) {
+		const MergeItem *it = &job->items[k];
+		if (!it->merged[0]) continue;
+		for (int i = 0; i < a->wl.n; i++) {
+			Word *w = &a->wl.words[i];
+			if (strcmp(w->word, it->word) != 0 || strcmp(w->meaning, it->meaning) != 0) continue;   /* 期间被删 / 改过就不动 */
+			snprintf(w->meaning, sizeof w->meaning, "%s", it->merged);
+			changed[i] = true;
+			if (applied++ < 6 && j < sizeof list)
+				j += (size_t)snprintf(list + j, sizeof list - j, "\n%s：%s", w->word, w->meaning);
+			break;
+		}
+	}
+	if (applied > 0) {
+		a->wl_rev++;
+		for (int i = 0; i < 2; i++) {   /* 正在考的词释义变了：义项重拆 */
+			Drill *d = &a->drill[i];
+			if (d->sense_of > 0 && changed[d->sense_of - 1]) senses_reset(d);
+		}
+	}
+	bool saved = applied == 0 || words_save(&a->wl);
+
+	const char *sep = job->intro[0] ? "\n" : "";
+	if (!saved)
+		fb_set(&a->add_fb, XTK_INFOBAR_ERROR, "合并结果没存上", "%s%s写入词表失败：%s", job->intro, sep, a->wl.path);
+	else if (applied > 0)
+		fb_set(&a->add_fb, XTK_INFOBAR_SUCCESS, "已合并意思相同的释义", "%s%s%d 个词的释义有合并%s，写其中任何一个都算答对这一项：%s%s",
+		       job->intro, sep, applied, job->failed ? "（智能判分中途断开，后面的没查完）" : "", list, applied > 6 ? "\n…" : "");
+	else if (job->failed)
+		fb_set(&a->add_fb, XTK_INFOBAR_WARNING, "一词多义没有检查", "%s%s智能判分没启动或中途断开，释义照原样保存。", job->intro, sep);
+	else if (job->intro[0])
+		fb_set(&a->add_fb, XTK_INFOBAR_SUCCESS, "已录入", "%s\n一词多义里没有意思相同的释义。", job->intro);
+	else
+		fb_set(&a->add_fb, XTK_INFOBAR_INFORMATIONAL, "没有要合并的释义", "检查了 %d 个多义词，没有意思相同的释义。", job->n);
+	free(job);
+}
+
+static void do_merge_all(App *a)
+{
+	if (a->merging) return;
+	if (!start_merge(a, 0, a->wl.n, NULL))
+		fb_set(&a->add_fb, XTK_INFOBAR_INFORMATIONAL, "没有要检查的词", "词库里没有一词多义的词。");
+}
+
 static void add_text(App *a, const char *text)
 {
 	AddStat st;
+	int     before = a->wl.n;
 	words_add_text(&a->wl, text, &st);
 	Feedback *fb = &a->add_fb;
 	if (st.err[0]) {
@@ -458,7 +620,10 @@ static void add_text(App *a, const char *text)
 	} else {
 		fb_set(fb, XTK_INFOBAR_SUCCESS, "已录入", "新增 %d 个词，现在共 %d 个词。新词排在词表末尾。", st.added, a->wl.n);
 	}
-	if (st.added > 0) words_changed(a);
+	if (st.added > 0) {
+		words_changed(a);
+		start_merge(a, before, a->wl.n, fb->msg);   /* 新词里的一词多义：意思相同的释义合并 */
+	}
 }
 
 /* 剪贴板文本 → UTF-8（调用方 free） */
@@ -530,6 +695,9 @@ static void update(void *model, XtkMsg msg)
 	case MSG_CLEAR_ASK:     a->clear_open = true;            break;
 	case MSG_CLEAR_RESULT:  do_clear_result(a, msg.i);       break;
 	case MSG_ALL_SENSES:    do_all_senses(a, msg.b);         break;
+	case MSG_MERGE_ALL:     do_merge_all(a);                 break;
+	case MSG_MERGE_PROGRESS: on_merge_progress(a, msg.i, (int)msg.f); break;
+	case MSG_MERGE_DONE:    if (msg.ptr) on_merge_done(a, (MergeJob *)msg.ptr); break;
 	default: break;
 	}
 }
@@ -872,6 +1040,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int showCmd)
 	};
 	int rc = app_run(&cfg, a);
 
+	InterlockedExchange(&g_quit, 1);
 	judge_destroy(a->judge);
 	return rc;
 }

@@ -38,6 +38,12 @@ int  split_senses(const char *meaning, char out[][DICT_SENSE_LEN], int max);
 /* 答案（可一次写多个，同样分隔）逐条对还没答出的义项，命中的在 *got 里置位；返回新答出的个数 */
 int  senses_mark(const char *ans, char senses[][DICT_SENSE_LEN], int ns, uint32_t *got);
 
+/* 合并意思相同的义项：link[i] 的第 j 位 = 义项 i、j 同义（按连通关系合并，a≈b、b≈c → 三条合一）。
+ * 同一组写成「第一条（其余、…）」，组与组之间用「、」，保持原来的先后顺序；
+ * 括号里的照旧不用写，写组里任何一条都算答对这一项（meaning_match 认括号里的字）。
+ * 有合并时把新释义写进 out 并返回 true；没有可合并的返回 false、不动 out */
+bool senses_merge(char senses[][DICT_SENSE_LEN], int ns, const uint32_t *link, char *out, size_t cap);
+
 /* 「释义 → 单词」判对：不分大小写、忽略 '.'、多余空格不计（"take sth into account" == "take sth. into  account"） */
 bool answer_eq(const char *ans, const char *word);
 

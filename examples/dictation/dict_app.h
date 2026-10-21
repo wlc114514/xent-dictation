@@ -35,6 +35,9 @@ enum {
 	MSG_CLEAR_ASK,     /* 打开「清空词库」确认框 */
 	MSG_CLEAR_RESULT,  /* 确认框结果（.i = XtkDialogResult） */
 	MSG_ALL_SENSES,    /* 「多义词要全答」开关（.b = 新状态） */
+	MSG_MERGE_ALL,     /* 词库页「合并同义释义」：检查整个词库 */
+	MSG_MERGE_PROGRESS,/* 合并检查进度（.i = 已查对数，.f = 总对数） */
+	MSG_MERGE_DONE,    /* 合并检查结束（.ptr = MergeJob，处理完释放） */
 };
 
 /* 导航栏条目（下标即 MSG_NAV 的 .i） */
@@ -85,6 +88,7 @@ typedef struct App {
 	bool judging;
 
 	Feedback add_fb;     /* 词库页的导入结果 */
+	bool     merging;    /* 后台正在检查一词多义里意思相同的释义 */
 	bool     clear_open; /* 「清空词库」确认框 */
 
 	bool all_senses;     /* 一词多义要把每个意思都答出来；关掉则答出任一个就算对 */
