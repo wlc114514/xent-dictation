@@ -82,6 +82,8 @@ static void test_text(void)
 	CHECK(meaning_match("无用", "无用的、废物"), "两边都有否定字照常");
 	CHECK(meaning_match("废物", "无用的、废物"), "别的义项有否定字不影响");
 	CHECK(meaning_match("不合理的", "不合理的"), "完全相同照常");
+	CHECK(meaning_match("非常重要的", "重要的"), "「非常」不是否定");
+	CHECK(meaning_match("差不多", "几乎、差不多"), "「差不多」不是否定");
 	CHECK(!meaning_match("悲观", "乐观"), "意思相反");
 	CHECK(!meaning_match("", "公正"), "空答案");
 	CHECK(!meaning_match("abc", "公正"), "没有汉字");

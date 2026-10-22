@@ -124,10 +124,20 @@ static uint32_t neg_mask(const uint32_t *cp, int n)
 {
 	static const uint32_t NEG[] = {0x4E0D /* 不 */, 0x975E /* 非 */, 0x65E0 /* 无 */, 0x672A /* 未 */, 0x6CA1 /* 没 */,
 	                               0x53CD /* 反 */, 0x5426 /* 否 */, 0x83AB /* 莫 */, 0x52FF /* 勿 */};
+	/* 含否定字但不表否定的常用词，跳过（「几乎」=「差不多」、「重要的」≈「非常重要的」；与网页版 NOT_NEGATION 一致） */
+	static const char *const NOT_NEG[] = {"差不多", "不得不", "不错", "不断", "不久", "非常", "无论", "未来", "反而", "反应", "反映", "莫非"};
 	uint32_t m = 0;
-	for (int i = 0; i < n; i++)
+	for (int i = 0; i < n; i++) {
+		int skip = 0;
+		for (int w = 0; w < (int)(sizeof NOT_NEG / sizeof NOT_NEG[0]) && !skip; w++) {
+			uint32_t word[4];
+			int      len = utf8_cjk(NOT_NEG[w], word, 4);
+			if (i + len <= n && memcmp(cp + i, word, (size_t)len * 4) == 0) skip = len;
+		}
+		if (skip) { i += skip - 1; continue; }
 		for (int k = 0; k < (int)(sizeof NEG / sizeof NEG[0]); k++)
 			if (cp[i] == NEG[k]) m |= 1u << k;
+	}
 	return m;
 }
 
