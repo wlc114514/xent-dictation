@@ -119,6 +119,18 @@ static bool cp_subset(const uint32_t *m, int nm, const uint32_t *a, int na)
 	return true;
 }
 
+/* 否定字：「不合理」包含「合理」，按包含判就会把反义当成对。两边否定字不一样时不按包含判，交给模型 */
+static uint32_t neg_mask(const uint32_t *cp, int n)
+{
+	static const uint32_t NEG[] = {0x4E0D /* 不 */, 0x975E /* 非 */, 0x65E0 /* 无 */, 0x672A /* 未 */, 0x6CA1 /* 没 */,
+	                               0x53CD /* 反 */, 0x5426 /* 否 */, 0x83AB /* 莫 */, 0x52FF /* 勿 */};
+	uint32_t m = 0;
+	for (int i = 0; i < n; i++)
+		for (int k = 0; k < (int)(sizeof NEG / sizeof NEG[0]); k++)
+			if (cp[i] == NEG[k]) m |= 1u << k;
+	return m;
+}
+
 bool meaning_match(const char *ans, const char *meaning)
 {
 	uint32_t a[512], m[1024];
@@ -132,7 +144,8 @@ bool meaning_match(const char *ans, const char *meaning)
 		return la[0] && (strcmp(la, lm) == 0 || strstr(lm, la) != NULL);
 	}
 	if (na == nm && memcmp(a, m, (size_t)na * 4) == 0) return true;
-	if (na >= 2 && cp_contains(m, nm, a, na)) return true;
+	uint32_t neg = neg_mask(a, na);
+	if (na >= 2 && neg == neg_mask(m, nm) && cp_contains(m, nm, a, na)) return true;
 
 	/* 按 ; ，、/ 拆义项 */
 	uint32_t senses[32][64];
@@ -151,10 +164,11 @@ bool meaning_match(const char *ans, const char *meaning)
 
 	for (int i = 0; i < ns; i++) {
 		if (na == lens[i] && memcmp(a, senses[i], (size_t)na * 4) == 0) return true;
+		if (neg != neg_mask(senses[i], lens[i])) continue;
 		if (lens[i] >= 2 && cp_contains(a, na, senses[i], lens[i])) return true;
 		if (na >= 2 && cp_contains(senses[i], lens[i], a, na)) return true;
 	}
-	if (na >= 2 && cp_subset(m, nm, a, na)) {
+	if (na >= 2 && neg == neg_mask(m, nm) && cp_subset(m, nm, a, na)) {
 		int shortest = nm;
 		for (int i = 0; i < ns; i++) if (lens[i] < shortest) shortest = lens[i];
 		if (na * 2 >= shortest) return true;

@@ -75,6 +75,13 @@ static void test_text(void)
 	CHECK(meaning_match("分类", "把...分类"), "子串");
 	CHECK(meaning_match("屈服", "屈服；让步"), "义项之一");
 	CHECK(meaning_match("让步", "屈服；让步"), "第二个义项");
+	CHECK(!meaning_match("不合理的", "合理的"), "多了否定字不算包含");
+	CHECK(!meaning_match("合理", "不合理的"), "少了否定字不算包含");
+	CHECK(!meaning_match("不可能", "可能的、或许"), "义项也查否定字");
+	CHECK(!meaning_match("重要", "不重要的"), "字的子集也查否定字");
+	CHECK(meaning_match("无用", "无用的、废物"), "两边都有否定字照常");
+	CHECK(meaning_match("废物", "无用的、废物"), "别的义项有否定字不影响");
+	CHECK(meaning_match("不合理的", "不合理的"), "完全相同照常");
 	CHECK(!meaning_match("悲观", "乐观"), "意思相反");
 	CHECK(!meaning_match("", "公正"), "空答案");
 	CHECK(!meaning_match("abc", "公正"), "没有汉字");
