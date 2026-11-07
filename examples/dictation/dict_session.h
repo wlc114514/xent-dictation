@@ -17,6 +17,8 @@
  *     没见过的词保持原顺序跟在后面，从头再答；
  *   · 本组一次不错地答到最后一个 → 本组通过，进入下一组（上一组的词不再出现）；
  *   · 所有组都通过 → 无尽模式完成。
+ *   · 也可以只练一部分词（普通模式一轮的错词）：sess_start_endless_pool 把这些词打乱后同样每 20 个一组；
+ *     这时之后新加进词库的词不进来，「重新开始」还是这批词。
  */
 #pragma once
 
@@ -67,12 +69,19 @@ typedef struct Session {
 	int restarts;    /* 本组已重开次数 */
 
 	uint64_t rng;
+
+	/* 无尽模式只练一部分词：pool[0..npool) 是词表下标（已打乱）；npool = 0 表示整个词表。
+	 * 放在结构体末尾：旧版进度存档没有这两项，读进来是 0，正好是「整个词表」 */
+	int pool[DICT_MAX_WORDS];
+	int npool;
 } Session;
 
 void sess_seed(Session *s, uint64_t seed);
 
 void sess_start_rounds(Session *s, int nwords);
 void sess_start_endless(Session *s, int nwords);
+/* 无尽模式只练 words[0..n)（打乱后分组）；n = 0 等于 sess_start_endless */
+void sess_start_endless_pool(Session *s, int nwords, const int *words, int n);
 
 /* 当前题目的词表下标；没有题目（空/预览/完成）返回 -1 */
 int  sess_current(const Session *s);
@@ -107,3 +116,6 @@ int  sess_progress(const Session *s);
 
 /* 无尽模式总组数（按当前词数算） */
 int  sess_ngroups(const Session *s);
+
+/* 无尽模式要练的词数（只练一部分词时是 npool，否则是整个词表） */
+int  sess_endless_total(const Session *s);

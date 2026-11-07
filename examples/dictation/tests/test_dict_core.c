@@ -45,6 +45,12 @@ static void ok_next(Session *s)
 	sess_next(s);
 }
 
+static bool in_list_t(const int *a, int n, int v)
+{
+	for (int i = 0; i < n; i++) if (a[i] == v) return true;
+	return false;
+}
+
 static bool is_perm_of_range(const int *a, int n, int lo, int hi)
 {
 	if (n != hi - lo) return false;
@@ -446,6 +452,50 @@ static void test_endless(void)
 }
 
 /* 随机「学生」跑完整个无尽模式，每一步检查不变量 */
+/* 普通模式一轮的错词进无尽模式（2026-11-07 需求：结果页把错词作为无尽模式的词汇，打乱） */
+static void test_endless_pool(void)
+{
+	sess_seed(&S, 20261107);
+	int  wrong[25];
+	for (int i = 0; i < 25; i++) wrong[i] = 100 + i * 3;   /* 词表 200 个词里错了 25 个 */
+
+	CASE("错词进无尽模式：只出这些词，打乱后每 20 个一组");
+	sess_start_endless_pool(&S, 200, wrong, 25);
+	CHECK(S.kind == SESS_ENDLESS && S.npool == 25 && sess_endless_total(&S) == 25, "npool=%d", S.npool);
+	CHECK(sess_ngroups(&S) == 2 && S.qlen == 20, "ngroups=%d qlen=%d", sess_ngroups(&S), S.qlen);
+	bool only_wrong = true, shuffled = false;
+	for (int i = 0; i < S.qlen; i++) {
+		only_wrong &= (S.queue[i] >= 100 && (S.queue[i] - 100) % 3 == 0);
+		shuffled |= (S.queue[i] != wrong[i]);
+	}
+	CHECK(only_wrong, "只能出错词");
+	CHECK(shuffled, "要打乱，不是原顺序");
+
+	CASE("错词：答完两组就完成，中途加的新词不进来");
+	sess_words_changed(&S, 230);
+	int seen[25], ns = 0, steps = 0;
+	while (S.phase != SP_DONE && steps++ < 200) {
+		int cur = sess_current(&S);
+		if (cur >= 0 && !in_list_t(seen, ns, cur)) seen[ns++] = cur;
+		ok_next(&S);
+	}
+	CHECK(S.phase == SP_DONE && ns == 25, "phase=%d 见过 %d 个", S.phase, ns);
+	for (int i = 0; i < ns; i++) CHECK(seen[i] < 200, "新加的词 %d 不该出现", seen[i]);
+
+	CASE("错词：重新开始还是这批词；换回全部词库清掉词池");
+	sess_restart(&S);
+	CHECK(S.npool == 25 && S.group == 0 && S.qlen == 20 && S.phase == SP_ASKING, "npool=%d group=%d", S.npool, S.group);
+	sess_start_endless(&S, 230);
+	CHECK(S.npool == 0 && sess_endless_total(&S) == 230 && S.queue[0] == 0, "npool=%d cur=%d", S.npool, S.queue[0]);
+
+	CASE("错词：重复的下标只算一次；清空词库清掉词池");
+	int dup[] = {5, 5, 7, 7, 9};
+	sess_start_endless_pool(&S, 200, dup, 5);
+	CHECK(S.npool == 3, "npool=%d", S.npool);
+	sess_words_changed(&S, 0);
+	CHECK(S.npool == 0 && S.phase == SP_EMPTY, "npool=%d phase=%d", S.npool, S.phase);
+}
+
 static void test_endless_fuzz(void)
 {
 	CASE("无尽模式压力测试：随机作答 300 局，每步检查不变量");
@@ -499,6 +549,7 @@ int main(void)
 	test_words();
 	test_rounds();
 	test_endless();
+	test_endless_pool();
 	test_endless_fuzz();
 	printf("\n%d 项通过，%d 项失败\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;

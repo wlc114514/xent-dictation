@@ -36,6 +36,8 @@ enum {
 	MSG_CLEAR_RESULT,  /* 确认框结果（.i = XtkDialogResult） */
 	MSG_ALL_SENSES,    /* 「多义词要全答」开关（.b = 新状态） */
 	MSG_MERGE_ALL,     /* 词库页「合并同义释义」：检查整个词库 */
+	MSG_ENDLESS_WRONG, /* 普通模式结果页：这一轮的错词打乱后进无尽模式 */
+	MSG_ENDLESS_ALL,   /* 无尽模式「换回全部词库」 */
 	MSG_MERGE_PROGRESS,/* 合并检查进度（.i = 已查对数，.f = 总对数） */
 	MSG_MERGE_DONE,    /* 合并检查结束（.ptr = MergeJob，处理完释放） */
 };

@@ -122,33 +122,48 @@ static void rounds_advance(Session *s)
 /* 无尽模式                                                            */
 /* ================================================================== */
 
-/* 第 g 组从词表下标 start 开始，取 group_size 个 */
+int sess_endless_total(const Session *s)
+{
+	return s->npool > 0 ? s->npool : s->nwords;
+}
+
+/* 第 g 组从第 start 个词开始（整个词表时就是词表下标，只练一部分词时是 pool 里的位置），取 group_size 个 */
 static void endless_load_group(Session *s, int g, int start)
 {
+	int total   = sess_endless_total(s);
 	s->group    = g;
 	s->gstart   = start;
 	s->gend     = start + s->group_size;
-	if (s->gend > s->nwords) s->gend = s->nwords;
+	if (s->gend > total) s->gend = total;
 	s->seen     = 0;
 	s->restarts = 0;
 	s->qlen     = 0;
-	for (int i = s->gstart; i < s->gend; i++) s->queue[s->qlen++] = i;   /* 组内按原顺序 */
+	for (int i = s->gstart; i < s->gend; i++) s->queue[s->qlen++] = s->npool > 0 ? s->pool[i] : i;   /* 组内按原顺序 */
 	begin_queue(s);
 }
 
 int sess_ngroups(const Session *s)
 {
 	if (s->kind != SESS_ENDLESS) return 0;
-	int rest = s->nwords - s->gend;
+	int rest = sess_endless_total(s) - s->gend;
 	return s->group + 1 + (rest > 0 ? (rest + s->group_size - 1) / s->group_size : 0);
 }
 
 void sess_start_endless(Session *s, int nwords)
 {
+	sess_start_endless_pool(s, nwords, NULL, 0);
+}
+
+void sess_start_endless_pool(Session *s, int nwords, const int *words, int n)
+{
 	s->kind       = SESS_ENDLESS;
 	s->nwords     = nwords;
 	s->group_size = ENDLESS_GROUP_SIZE;
 	s->wlen       = 0;
+	s->npool      = 0;
+	for (int i = 0; i < n; i++)
+		if (words[i] >= 0 && words[i] < nwords && !in_list(s->pool, s->npool, words[i])) s->pool[s->npool++] = words[i];
+	shuffle(s, s->pool, s->npool);
 	endless_load_group(s, 0, 0);
 }
 
@@ -177,7 +192,7 @@ static void endless_advance(Session *s)
 	if (s->pos < s->qlen) { s->phase = SP_ASKING; return; }
 
 	/* 一次不错地答完整组 → 下一组 */
-	if (s->gend < s->nwords) {
+	if (s->gend < sess_endless_total(s)) {
 		endless_load_group(s, s->group + 1, s->gend);   /* 上一组的词不再出现 */
 	} else {
 		s->pos   = s->qlen - 1;
@@ -238,7 +253,8 @@ int sess_next(Session *s)
 void sess_restart(Session *s)
 {
 	if (s->kind == SESS_ENDLESS) {
-		sess_start_endless(s, s->nwords);
+		s->wlen = 0;
+		endless_load_group(s, 0, 0);   /* 只练一部分词时还是这批词 */
 	} else if (s->round == 1 || s->phase == SP_DONE) {
 		sess_start_rounds(s, s->nwords);
 	} else {
@@ -268,6 +284,7 @@ void sess_words_changed(Session *s, int nwords)
 {
 	s->nwords = nwords;
 	if (nwords == 0) {
+		s->npool = 0;
 		s->qlen  = 0;
 		s->pos   = 0;
 		s->wlen  = 0;

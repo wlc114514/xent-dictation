@@ -377,6 +377,10 @@ typedef struct ProgressFile {
 	struct { Session s; int32_t answered, correct; } drill[2];
 } ProgressFile;
 
+/* 2026-11-07 前的存档：Session 末尾还没有词池（pool / npool），其余字段一样 */
+#define PROGRESS_HEAD     16
+#define SESSION_SIZE_OLD  offsetof(Session, pool)
+
 static char g_progress_path[MAX_PATH * 3];
 
 static void progress_save(const App *a)
@@ -405,14 +409,19 @@ static void progress_load(App *a)
 	char *buf = read_file(g_progress_path, &sz);
 	if (!buf) return;
 	const ProgressFile *pf = (const ProgressFile *)buf;
-	if (sz == (long)sizeof *pf && pf->magic == PROGRESS_MAGIC && pf->session_size == sizeof(Session) &&
-	    pf->nwords > 0 && pf->nwords <= a->wl.n && (pf->dir == DIR_CN2EN || pf->dir == DIR_EN2CN)) {
+	size_t ss = sz >= PROGRESS_HEAD ? pf->session_size : 0;   /* 新档 sizeof(Session)，旧档没有词池 */
+	if ((ss == sizeof(Session) || ss == SESSION_SIZE_OLD) && sz == (long)(PROGRESS_HEAD + 2 * (ss + 8)) &&
+	    pf->magic == PROGRESS_MAGIC && pf->nwords > 0 && pf->nwords <= a->wl.n && (pf->dir == DIR_CN2EN || pf->dir == DIR_EN2CN)) {
 		a->dir = (Dir)pf->dir;
 		for (int i = 0; i < 2; i++) {
-			Drill *d    = &a->drill[i];
-			d->s        = pf->drill[i].s;
-			d->answered = pf->drill[i].answered;
-			d->correct  = pf->drill[i].correct;
+			Drill         *d   = &a->drill[i];
+			const char    *rec = buf + PROGRESS_HEAD + (size_t)i * (ss + 8);
+			int32_t        stat[2];
+			memset(&d->s, 0, sizeof d->s);
+			memcpy(&d->s, rec, ss);
+			memcpy(stat, rec + ss, sizeof stat);
+			d->answered = stat[0];
+			d->correct  = stat[1];
 			if (d->s.phase == SP_CORRECT || d->s.phase == SP_REVEALED) sess_next(&d->s);   /* 上次答完没点「下一个」：直接到下一题 */
 			if (pf->nwords != a->wl.n) sess_words_changed(&d->s, a->wl.n);
 		}
@@ -445,6 +454,32 @@ static void reset_drill(Drill *d)
 	d->answered = d->correct = 0;
 	fb_clear(&d->fb);
 	senses_reset(d);
+}
+
+/* 普通模式结果页：这一轮的错词打乱后替换无尽模式的进度，切到无尽模式；普通模式停在结果页不动 */
+static void do_endless_wrong(App *a)
+{
+	Session *src = &a->drill[0].s;
+	if (src->kind != SESS_ROUNDS || src->phase != SP_PREVIEW || src->wlen == 0) return;
+	cancel_judging(a);
+	Drill *d = &a->drill[1];
+	sess_start_endless_pool(&d->s, a->wl.n, src->wrong, src->wlen);
+	reset_drill(d);
+	fb_set(&d->fb, XTK_INFOBAR_INFORMATIONAL, "错词无尽模式", "第 %d 轮的 %d 个错词已打乱，每 20 个一组。练完回「默写」还能接着开始第 %d 轮。",
+	       src->round, d->s.npool, src->round + 1);
+	a->page      = PAGE_ENDLESS;
+	a->answer[0] = 0;
+}
+
+/* 无尽模式「换回全部词库」：从整个词库第 1 组重新开始 */
+static void do_endless_all(App *a)
+{
+	Drill *d = &a->drill[1];
+	if (d->s.npool == 0) return;
+	cancel_judging(a);
+	sess_start_endless(&d->s, a->wl.n);
+	reset_drill(d);
+	a->answer[0] = 0;
 }
 
 static void do_restart(App *a)
@@ -751,6 +786,8 @@ static void update(void *model, XtkMsg msg)
 	case MSG_CLEAR_RESULT:  do_clear_result(a, msg.i);       break;
 	case MSG_ALL_SENSES:    do_all_senses(a, msg.b);         break;
 	case MSG_MERGE_ALL:     do_merge_all(a);                 break;
+	case MSG_ENDLESS_WRONG: do_endless_wrong(a);             break;
+	case MSG_ENDLESS_ALL:   do_endless_all(a);               break;
 	case MSG_MERGE_PROGRESS: on_merge_progress(a, msg.i, (int)msg.f); break;
 	case MSG_MERGE_DONE:    if (msg.ptr) on_merge_done(a, (MergeJob *)msg.ptr); break;
 	default: break;

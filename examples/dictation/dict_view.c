@@ -133,19 +133,22 @@ static const XtkSelectorItem DIR_ITEMS[] = {
 
 static XtkEl *drill_tools(XtkUi *ui, const App *a, bool endless)
 {
+	bool wrong_only = endless && a->drill[1].s.npool > 0;   /* 无尽模式正在练上一轮的错词 */
 	return xtk_row(ui, (XtkStackDesc){.gap = 8, .align = XENT_FLEX_ALIGN_CENTER},
 	    xtk_kids(
+	        wrong_only ? xtk_button(ui, "换回全部词库", (XtkButtonDesc){.style = XTK_BUTTON_SUBTLE, .icon = "List", .click = xtk_msg(MSG_ENDLESS_ALL)}) : NULL,
 	        xtk_selector(ui, (XtkSelectorBarDesc){.items = DIR_ITEMS, .nitem = 2, .sel = (int)a->dir, .select = xtk_msg(MSG_DIR)}),
 	        xtk_tooltip(ui,
 	            xtk_checkbox(ui, "多义词全答", (XtkToggleDesc){.checked = a->all_senses, .change = xtk_msg(MSG_ALL_SENSES)}),
 	            a->all_senses ? "单词 → 释义：有几个意思要全部写出来" : "单词 → 释义：写出任意一个意思就算对"),
 	        xtk_tooltip(ui,
 	            xtk_button(ui, NULL, (XtkButtonDesc){.style = XTK_BUTTON_SUBTLE, .icon = "Refresh", .click = xtk_msg(MSG_RESTART)}),
-	            endless ? "从第 1 组重新开始" : "从第 1 轮重新开始")));
+	            wrong_only ? "这批错词从第 1 组重新开始" : endless ? "从第 1 组重新开始" : "从第 1 轮重新开始")));
 }
 
 static const char *drill_blurb(XtkUi *ui, const App *a, const Session *s, bool endless)
 {
+	if (endless && s->npool > 0) return xtk_fmt(ui, "错词 %d 个 · 已打乱 · 每 20 词一组 · 整组全对才进下一组", s->npool);
 	if (endless) return "每 20 词一组 · 错一次本组打乱重来 · 整组全对才进下一组";
 	if (s->round == 1) return xtk_fmt(ui, "按词表顺序默写全部 %d 个词，错的词进下一轮。", a->wl.n);
 	return xtk_fmt(ui, "第 %d 轮 · 只默上一轮错的 %d 个词。", s->round, s->qlen);
@@ -176,6 +179,9 @@ static XtkEl *view_preview(XtkUi *ui, const App *a, const Drill *d)
 	    xtk_row(ui, (XtkStackDesc){.gap = 8, .justify = XENT_FLEX_JUSTIFY_END, .fill = true},
 	        xtk_kids(
 	            xtk_button(ui, "从头开始", (XtkButtonDesc){.icon = "Refresh", .click = xtk_msg(MSG_RESTART)}),
+	            xtk_tooltip(ui,
+	                xtk_button(ui, "错词进无尽模式", (XtkButtonDesc){.icon = "Sync", .click = xtk_msg(MSG_ENDLESS_WRONG)}),
+	                "这一轮的错词打乱后替换无尽模式的进度；这里的结果页不变"),
 	            xtk_button(ui, xtk_fmt(ui, "开始第 %d 轮", s->round + 1),
 	                       (XtkButtonDesc){.style = XTK_BUTTON_ACCENT, .icon = "Play", .click = xtk_msg(MSG_START_ROUND)})))));
 }
@@ -186,7 +192,7 @@ static XtkEl *view_done(XtkUi *ui, const App *a, const Drill *d, bool endless)
 	const Session *s = &d->s;
 	const char *big = endless ? xtk_fmt(ui, "%d 组全部过关", s->group + 1)
 	                          : xtk_fmt(ui, "%d 个词全部默对", s->nwords);
-	const char *sub = endless ? xtk_fmt(ui, "无尽模式完成 · 共 %d 个词", s->nwords)
+	const char *sub = endless ? xtk_fmt(ui, "无尽模式完成 · 共 %d 个%s", sess_endless_total(s), s->npool > 0 ? "错词" : "词")
 	                          : xtk_fmt(ui, "用了 %d 轮", s->round);
 	return fill_page(ui, endless ? "done-endless" : "done", xtk_kids(
 	    page_header(ui, endless ? "无尽模式" : "默写", NULL, drill_tools(ui, a, endless)),
@@ -289,8 +295,9 @@ static XtkEl *view_drill(XtkUi *ui, App *a, Drill *d, bool endless)
 	                                                   .justify = XENT_FLEX_JUSTIFY_CENTER, .fill = true},
 	    xtk_kids(
 	        xtk_text(ui, w->pos, (XtkTextDesc){.size = 13, .align = XTK_TEXT_CENTER, .color = COL_SECONDARY}),
-	        prompt,
-	        hint,
+	        /* 题面和提示包成一组：多义词有提示、单意词没有，输入框在卡片里的位置也不变。
+	         * 框架按位置认控件，位置一挪输入框就被重建、焦点丢掉（多义词和单意词交替时要重新点输入框） */
+	        xtk_column(ui, (XtkStackDesc){.gap = 18, .align = XENT_FLEX_ALIGN_STRETCH}, xtk_kids(prompt, hint)),
 	        xtk_margin(input, (XentInsets){0, 8, 0, 0}),
 	        feedback_bar(ui, &d->fb, (XtkMsg){0}),
 	        xtk_row(ui, (XtkStackDesc){.gap = 8, .justify = XENT_FLEX_JUSTIFY_CENTER}, xtk_kids(act1, act2)))), 1.0f);
@@ -368,7 +375,8 @@ static XtkEl *view_help(XtkUi *ui)
 	        section(ui, "无尽模式", NULL, para(ui,
 	            "词表按顺序每 20 个分一组，组内按原顺序出题。\n"
 	            "提交答错可以继续重试；点「不知道」才公布答案并触发本组重开：本组见过的词（之前答对的和这次错的）打乱顺序排在前面，没见过的词保持原顺序跟在后面，从头再答。\n"
-	            "整组一次不错地答完才进入下一组，上一组的词不再出现；所有组都过关才算完成。")),
+	            "整组一次不错地答完才进入下一组，上一组的词不再出现；所有组都过关才算完成。\n"
+	            "默写一轮结束的结果页可以点「错词进无尽模式」：这一轮的错词打乱后替换无尽模式的进度，点「换回全部词库」回到整个词库。")),
 	        section(ui, "题型与判分", NULL, para(ui,
 	            "释义 → 单词：看中文写英文，下方蓝色字母是开头提示，不分大小写。\n"
 	            "单词 → 释义：看英文写中文。有多个意思的词（释义里用 、 ; 或空格隔开）要把每个意思都写出来："
