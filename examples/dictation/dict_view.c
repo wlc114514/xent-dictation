@@ -148,8 +148,8 @@ static XtkEl *drill_tools(XtkUi *ui, const App *a, bool endless)
 
 static const char *drill_blurb(XtkUi *ui, const App *a, const Session *s, bool endless)
 {
-	if (endless && s->npool > 0) return xtk_fmt(ui, "错词 %d 个 · 已打乱 · 每 20 词一组 · 整组全对才进下一组", s->npool);
-	if (endless) return "每 20 词一组 · 错一次本组打乱重来 · 整组全对才进下一组";
+	if (endless && s->npool > 0) return xtk_fmt(ui, "错词 %d 个 · 已打乱 · 每 20 词一组 · 对满 15 次换新词 · 整组全对才进下一组", s->npool);
+	if (endless) return "每 20 词一组 · 错一次本组打乱重来 · 对满 15 次换新词 · 整组全对才进下一组";
 	if (s->round == 1) return xtk_fmt(ui, "按词表顺序默写全部 %d 个词，错的词进下一轮。", a->wl.n);
 	return xtk_fmt(ui, "第 %d 轮 · 只默上一轮错的 %d 个词。", s->round, s->qlen);
 }
@@ -237,7 +237,8 @@ static XtkEl *view_drill(XtkUi *ui, App *a, Drill *d, bool endless)
 
 	/* —— 进度 —— */
 	const char *where = endless
-	    ? xtk_fmt(ui, "第 %d / %d 组%s", s->group + 1, sess_ngroups(s), s->restarts ? xtk_fmt(ui, " · 本组已重开 %d 次", s->restarts) : "")
+	    ? xtk_fmt(ui, "第 %d / %d 组 · 这个词已对 %d/%d%s", s->group + 1, sess_ngroups(s), s->hits[sess_current(s)], ENDLESS_RETIRE_HITS,
+	              s->restarts ? xtk_fmt(ui, " · 本组已重开 %d 次", s->restarts) : "")
 	    : (s->round > 1 ? xtk_fmt(ui, "第 %d 轮 · 错词复习", s->round) : "第 1 轮");
 	XtkEl *progress = xtk_column(ui, (XtkStackDesc){.gap = 8, .align = XENT_FLEX_ALIGN_STRETCH},
 	    xtk_kids(
@@ -308,7 +309,8 @@ static XtkEl *view_drill(XtkUi *ui, App *a, Drill *d, bool endless)
 	        xtk_kids(
 	            stat_tile(ui, "当前组", xtk_fmt(ui, "%d / %d", s->group + 1, sess_ngroups(s))),
 	            stat_tile(ui, "本组已见过", xtk_fmt(ui, "%d / %d", s->seen > s->pos + 1 ? s->seen : s->pos + 1, s->qlen)),
-	            stat_tile(ui, "已过关的词", xtk_fmt(ui, "%d", s->gstart))))
+	            stat_tile(ui, "已过关的词", xtk_fmt(ui, "%d", sess_endless_passed(s))),
+	            stat_tile(ui, xtk_fmt(ui, "已掌握（对满 %d 次）", ENDLESS_RETIRE_HITS), xtk_fmt(ui, "%d", sess_mastered(s)))))
 	    : xtk_row(ui, (XtkStackDesc){.gap = 12, .align = XENT_FLEX_ALIGN_STRETCH, .fill = true},
 	        xtk_kids(
 	            stat_tile(ui, "已作答", xtk_fmt(ui, "%d", d->answered)),
@@ -375,6 +377,8 @@ static XtkEl *view_help(XtkUi *ui)
 	        section(ui, "无尽模式", NULL, para(ui,
 	            "词表按顺序每 20 个分一组，组内按原顺序出题。\n"
 	            "提交答错可以继续重试；点「不知道」才公布答案并触发本组重开：本组见过的词（之前答对的和这次错的）打乱顺序排在前面，没见过的词保持原顺序跟在后面，从头再答。\n"
+	            "一个词一次答对（没先提交答错）满 15 次就移出本组，从后面的词里按顺序补一个进来，本组保持 20 个；"
+	            "「不知道」不清零次数，从第 1 组重新开始才清零。\n"
 	            "整组一次不错地答完才进入下一组，上一组的词不再出现；所有组都过关才算完成。\n"
 	            "默写一轮结束的结果页可以点「错词进无尽模式」：这一轮的错词打乱后替换无尽模式的进度，点「换回全部词库」回到整个词库。")),
 	        section(ui, "题型与判分", NULL, para(ui,

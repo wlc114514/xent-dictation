@@ -50,7 +50,8 @@ static void shuffle(Session *s, int *a, int n)
 
 static void begin_queue(Session *s)
 {
-	s->pos   = 0;
+	s->pos     = 0;
+	s->fumbled = 0;
 	s->phase = (s->qlen > 0) ? SP_ASKING : SP_EMPTY;
 }
 
@@ -127,6 +128,12 @@ int sess_endless_total(const Session *s)
 	return s->npool > 0 ? s->npool : s->nwords;
 }
 
+/* 总顺序里第 i 个词的词表下标 */
+static int endless_word(const Session *s, int i)
+{
+	return s->npool > 0 ? s->pool[i] : i;
+}
+
 /* 第 g 组从第 start 个词开始（整个词表时就是词表下标，只练一部分词时是 pool 里的位置），取 group_size 个 */
 static void endless_load_group(Session *s, int g, int start)
 {
@@ -138,8 +145,43 @@ static void endless_load_group(Session *s, int g, int start)
 	s->seen     = 0;
 	s->restarts = 0;
 	s->qlen     = 0;
-	for (int i = s->gstart; i < s->gend; i++) s->queue[s->qlen++] = s->npool > 0 ? s->pool[i] : i;   /* 组内按原顺序 */
+	for (int i = s->gstart; i < s->gend; i++) s->queue[s->qlen++] = endless_word(s, i);   /* 组内按原顺序 */
 	begin_queue(s);
+}
+
+int sess_mastered(const Session *s)
+{
+	int n = 0;
+	for (int i = 0; i < s->nwords && i < DICT_MAX_WORDS; i++)
+		if (s->hits[i] >= ENDLESS_RETIRE_HITS) n++;
+	return n;
+}
+
+int sess_endless_passed(const Session *s)
+{
+	if (s->kind != SESS_ENDLESS) return 0;
+	return s->phase == SP_DONE ? sess_endless_total(s) : s->gend - s->qlen;
+}
+
+/* 当前词一次答对满次数 → 移出本组（后面的词顶上来，pos 不动），再从没进过组的词里补满 */
+static bool endless_retire(Session *s)
+{
+	int w = s->queue[s->pos];
+	if (s->fumbled || ++s->hits[w] < ENDLESS_RETIRE_HITS) return false;
+
+	if (s->pos + 1 > s->seen) s->seen = s->pos + 1;
+	s->seen--;   /* 它本来算见过 */
+	memmove(s->queue + s->pos, s->queue + s->pos + 1, sizeof(int) * (size_t)(s->qlen - s->pos - 1));
+	s->qlen--;
+	s->retired = w;
+
+	int total = sess_endless_total(s);
+	while (s->qlen < s->group_size && s->gend < total) {
+		int nw = endless_word(s, s->gend++);
+		s->queue[s->qlen++] = nw;   /* 没见过，排最后 */
+		s->joined = nw;
+	}
+	return true;
 }
 
 int sess_ngroups(const Session *s)
@@ -161,6 +203,7 @@ void sess_start_endless_pool(Session *s, int nwords, const int *words, int n)
 	s->group_size = ENDLESS_GROUP_SIZE;
 	s->wlen       = 0;
 	s->npool      = 0;
+	memset(s->hits, 0, sizeof s->hits);
 	for (int i = 0; i < n; i++)
 		if (words[i] >= 0 && words[i] < nwords && !in_list(s->pool, s->npool, words[i])) s->pool[s->npool++] = words[i];
 	shuffle(s, s->pool, s->npool);
@@ -187,15 +230,18 @@ static void endless_reset_group(Session *s)
 
 static void endless_advance(Session *s)
 {
-	s->pos++;
-	if (s->pos > s->seen) s->seen = s->pos;
+	if (!endless_retire(s)) {
+		s->pos++;
+		if (s->pos > s->seen) s->seen = s->pos;
+	}
+	s->fumbled = 0;
 	if (s->pos < s->qlen) { s->phase = SP_ASKING; return; }
 
 	/* 一次不错地答完整组 → 下一组 */
 	if (s->gend < sess_endless_total(s)) {
 		endless_load_group(s, s->group + 1, s->gend);   /* 上一组的词不再出现 */
 	} else {
-		s->pos   = s->qlen - 1;
+		s->pos   = s->qlen > 0 ? s->qlen - 1 : 0;
 		s->phase = SP_DONE;
 	}
 }
@@ -215,7 +261,8 @@ void sess_answer(Session *s, bool correct)
 	if (correct) {
 		s->phase = SP_CORRECT;
 	} else {
-		s->phase = SP_WRONG;               /* 提交答错只允许重试；「不知道」才公布答案并重开 */
+		s->phase   = SP_WRONG;             /* 提交答错只允许重试；「不知道」才公布答案并重开 */
+		s->fumbled = 1;
 	}
 }
 
@@ -229,6 +276,7 @@ void sess_dont_know(Session *s)
 int sess_next(Session *s)
 {
 	int skipped = -1;
+	s->retired = s->joined = -1;
 	switch (s->phase) {
 	case SP_CORRECT:
 		if (s->kind == SESS_ENDLESS) endless_advance(s);
@@ -254,6 +302,7 @@ void sess_restart(Session *s)
 {
 	if (s->kind == SESS_ENDLESS) {
 		s->wlen = 0;
+		memset(s->hits, 0, sizeof s->hits);
 		endless_load_group(s, 0, 0);   /* 只练一部分词时还是这批词 */
 	} else if (s->round == 1 || s->phase == SP_DONE) {
 		sess_start_rounds(s, s->nwords);
@@ -285,6 +334,7 @@ void sess_words_changed(Session *s, int nwords)
 	s->nwords = nwords;
 	if (nwords == 0) {
 		s->npool = 0;
+		memset(s->hits, 0, sizeof s->hits);
 		s->qlen  = 0;
 		s->pos   = 0;
 		s->wlen  = 0;

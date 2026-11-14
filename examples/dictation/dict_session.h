@@ -16,6 +16,9 @@
  *   · 点「重新开始」→ 本组所有见过的词（之前答对的 + 这次错的）打乱顺序排在最前，
  *     没见过的词保持原顺序跟在后面，从头再答；
  *   · 本组一次不错地答到最后一个 → 本组通过，进入下一组（上一组的词不再出现）；
+ *   · 一个词一次答对（没先提交答错）满 15 次 → 移出本组，从后面的词里按顺序补一个进来，本组保持 20 个；
+ *     补进来的词算没见过，排在本组最后。词用完了就不补，本组变少，全部移出也算本组过关；
+ *     「不知道」不清零次数，从第 1 组重新开始才清零；
  *   · 所有组都通过 → 无尽模式完成。
  *   · 也可以只练一部分词（普通模式一轮的错词）：sess_start_endless_pool 把这些词打乱后同样每 20 个一组；
  *     这时之后新加进词库的词不进来，「重新开始」还是这批词。
@@ -28,6 +31,7 @@
 #include "dict_words.h"   /* DICT_MAX_WORDS */
 
 #define ENDLESS_GROUP_SIZE 20
+#define ENDLESS_RETIRE_HITS 15   /* 一次答对满这么多次就移出本组 */
 
 typedef enum SessKind {
 	SESS_ROUNDS = 0,   /* 普通模式 */
@@ -63,8 +67,8 @@ typedef struct Session {
 	/* 无尽模式 */
 	int group_size;
 	int group;       /* 当前组（0 起） */
-	int gstart;      /* 当前组在词表里的范围 [gstart, gend) */
-	int gend;
+	int gstart;      /* 当前组从第 gstart 个词开始；[gend, 总数) 是还没进过组的词 */
+	int gend;        /* 本组移出词后从 gend 往里补，所以本组的词 = queue，不一定是 [gstart, gend) 全部 */
 	int seen;        /* queue 前 seen 个词是本组已经见过的 */
 	int restarts;    /* 本组已重开次数 */
 
@@ -74,6 +78,11 @@ typedef struct Session {
 	 * 放在结构体末尾：旧版进度存档没有这两项，读进来是 0，正好是「整个词表」 */
 	int pool[DICT_MAX_WORDS];
 	int npool;
+
+	/* 无尽模式「一次答对满 15 次就移出」。同样放在末尾：2026-11-14 前的存档读进来全是 0 */
+	int hits[DICT_MAX_WORDS];   /* 每个词（词表下标）一次答对的次数 */
+	int fumbled;                /* 当前这题提交答错过（再答对不算一次答对） */
+	int retired, joined;        /* 刚才 sess_next 移出的词 / 补进来的词（词表下标，没有是 -1） */
 } Session;
 
 void sess_seed(Session *s, uint64_t seed);
@@ -116,6 +125,12 @@ int  sess_progress(const Session *s);
 
 /* 无尽模式总组数（按当前词数算） */
 int  sess_ngroups(const Session *s);
+
+/* 无尽模式里一次答对满 ENDLESS_RETIRE_HITS 次、已经移出的词数 */
+int  sess_mastered(const Session *s);
+
+/* 无尽模式已经过关的词数（之前的组 + 本组移出的） */
+int  sess_endless_passed(const Session *s);
 
 /* 无尽模式要练的词数（只练一部分词时是 npool，否则是整个词表） */
 int  sess_endless_total(const Session *s);

@@ -522,6 +522,66 @@ static void test_endless_pool(void)
 	CHECK(S.npool == 0 && S.phase == SP_EMPTY, "npool=%d phase=%d", S.npool, S.phase);
 }
 
+/* 2026-11-14 需求：一个词一次答对满 15 次就移出本组，补一个新词进来，本组保持 20 个 */
+static void test_endless_retire(void)
+{
+	sess_seed(&S, 20261114);
+
+	CASE("对满 15 次：第 15 次答对后移出本组，第 21 个词补到最后");
+	sess_start_endless(&S, 45);
+	for (int k = 0; k < 14; k++) {   /* 答对词 0 → 词 1 点不知道 → 重开（刚错的不放第一个，所以又是词 0） */
+		ok_next(&S);
+		sess_dont_know(&S);
+		sess_next(&S);
+	}
+	CHECKQ(sess_current(&S) == 0 && S.hits[0] == 14, "应该又轮到词 0，已对 14 次");
+	ok_next(&S);
+	CHECK(S.retired == 0 && S.joined == 20, "retired=%d joined=%d", S.retired, S.joined);
+	CHECKQ(S.qlen == 20 && !in_list_t(S.queue, S.qlen, 0) && S.queue[19] == 20, "本组 20 个、没有词 0、词 20 在最后");
+	CHECKQ(S.pos == 0 && sess_current(&S) == 1 && S.seen == 1 && S.phase == SP_ASKING, "接着考词 1（见过的只剩它）");
+	CHECK(S.gend == 21 && sess_ngroups(&S) == 3 && sess_mastered(&S) == 1 && sess_endless_passed(&S) == 1,
+	      "gend=%d ngroups=%d mastered=%d passed=%d", S.gend, sess_ngroups(&S), sess_mastered(&S), sess_endless_passed(&S));
+
+	CASE("对满 15 次：提交答错再答对不算一次答对；「不知道」不清零");
+	int cur = sess_current(&S), h = S.hits[cur];
+	sess_answer(&S, false);
+	sess_answer(&S, true);
+	sess_next(&S);
+	CHECK(S.hits[cur] == h && h == 0 && S.retired == -1, "答错过再答对：hits %d → %d", h, S.hits[cur]);
+	sess_restart(&S);
+	ok_next(&S);   /* 词 0 一次答对 */
+	sess_dont_know(&S);
+	sess_next(&S);
+	CHECK(S.hits[0] == 1, "「不知道」不清零：%d", S.hits[0]);
+
+	CASE("对满 15 次：整个无尽模式重新开始才清零");
+	sess_restart(&S);
+	CHECK(S.hits[0] == 0 && S.hits[1] == 0 && sess_mastered(&S) == 0 && S.gend == 20 && S.queue[0] == 0,
+	      "hits0=%d hits1=%d gend=%d", S.hits[0], S.hits[1], S.gend);
+
+	CASE("对满 15 次：后面没有新词就不补，本组变少；全部移出算本组过关 → 完成");
+	sess_start_endless(&S, 21);
+	S.hits[0] = 14;
+	ok_next(&S);
+	CHECK(S.joined == 20 && S.qlen == 20 && S.gend == 21, "第一次还有词 20 可补：joined=%d", S.joined);
+	S.hits[sess_current(&S)] = 14;
+	ok_next(&S);
+	CHECK(S.retired >= 0 && S.joined == -1 && S.qlen == 19, "没词可补：joined=%d qlen=%d", S.joined, S.qlen);
+	for (int i = 0; i < 21; i++) S.hits[i] = S.hits[i] >= ENDLESS_RETIRE_HITS ? S.hits[i] : 14;
+	int steps = 0;
+	while (S.phase != SP_DONE && steps++ < 100) ok_next(&S);
+	CHECK(S.phase == SP_DONE && S.qlen == 0 && sess_mastered(&S) == 21 && sess_endless_passed(&S) == 21,
+	      "phase=%d qlen=%d mastered=%d", S.phase, S.qlen, sess_mastered(&S));
+
+	CASE("对满 15 次：错词池里也一样，从词池后面补");
+	int wrong[25];
+	for (int i = 0; i < 25; i++) wrong[i] = 100 + i * 3;
+	sess_start_endless_pool(&S, 200, wrong, 25);
+	S.hits[sess_current(&S)] = 14;
+	ok_next(&S);
+	CHECK(S.joined == S.pool[20] && S.queue[19] == S.pool[20] && S.qlen == 20, "joined=%d pool[20]=%d", S.joined, S.pool[20]);
+}
+
 static void test_endless_fuzz(void)
 {
 	CASE("无尽模式压力测试：随机作答 300 局，每步检查不变量");
@@ -533,7 +593,16 @@ static void test_endless_fuzz(void)
 		uint64_t r = 0x12345678u + (uint64_t)game;
 		int steps = 0;
 		while (S.phase != SP_DONE && steps++ < 200000) {
-			if (!is_perm_of_range(S.queue, S.qlen, S.gstart, S.gend)) { bad = 1; break; }
+			/* 本组的词：[gstart, gend) 里去掉已移出（对满 15 次）的，不重复、不超过 20 个 */
+			int retired = 0;
+			for (int i = S.gstart; i < S.gend; i++) retired += S.hits[i] >= ENDLESS_RETIRE_HITS;
+			static int sorted[DICT_MAX_WORDS];
+			memcpy(sorted, S.queue, sizeof(int) * (size_t)S.qlen);
+			bool ok = S.qlen + retired == S.gend - S.gstart && S.qlen <= ENDLESS_GROUP_SIZE;
+			for (int i = 0; ok && i < S.qlen; i++)
+				ok = sorted[i] >= S.gstart && sorted[i] < S.gend && S.hits[sorted[i]] < ENDLESS_RETIRE_HITS
+				     && !in_list_t(sorted, i, sorted[i]);
+			if (!ok) { bad = 1; break; }
 			int cur = sess_current(&S);
 			if (cur < S.gstart || cur >= S.gend) { bad = 2; break; }
 			r = r * 6364136223846793005ull + 1442695040888963407ull;
@@ -576,6 +645,7 @@ int main(void)
 	test_rounds();
 	test_endless();
 	test_endless_pool();
+	test_endless_retire();
 	test_endless_fuzz();
 	printf("\n%d 项通过，%d 项失败\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;

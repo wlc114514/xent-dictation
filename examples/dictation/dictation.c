@@ -351,6 +351,12 @@ static void do_next(App *a)
 		else if (d->s.restarts != restarts)
 			fb_set(&d->fb, XTK_INFOBAR_INFORMATIONAL, "本组重新开始",
 			       "见过的 %d 个词已打乱顺序排在前面，没见过的词保持原顺序。", d->s.seen);
+		else if (d->s.retired >= 0 && d->s.joined >= 0)
+			fb_set(&d->fb, XTK_INFOBAR_SUCCESS, "掌握一个词", "%s 已一次答对 %d 次，移出本组，换上 %s。",
+			       a->wl.words[d->s.retired].word, ENDLESS_RETIRE_HITS, a->wl.words[d->s.joined].word);
+		else if (d->s.retired >= 0)
+			fb_set(&d->fb, XTK_INFOBAR_SUCCESS, "掌握一个词", "%s 已一次答对 %d 次，移出本组。后面没有新词了，本组还剩 %d 个。",
+			       a->wl.words[d->s.retired].word, ENDLESS_RETIRE_HITS, d->s.qlen);
 	}
 }
 
@@ -377,9 +383,12 @@ typedef struct ProgressFile {
 	struct { Session s; int32_t answered, correct; } drill[2];
 } ProgressFile;
 
-/* 2026-11-07 前的存档：Session 末尾还没有词池（pool / npool），其余字段一样 */
+/* 旧存档：Session 末尾少几项，其余字段一样，少的读进来是 0
+ *   2026-11-07 前没有词池（pool / npool），2026-11-14 前没有「答对满 15 次移出」（hits …） */
 #define PROGRESS_HEAD     16
 #define SESSION_SIZE_OLD  offsetof(Session, pool)
+/* 旧版 sizeof 带末尾对齐填充（rng 是 uint64，按 8 对齐）：npool 结束在 32068，旧 sizeof 是 32072 */
+#define SESSION_SIZE_V2   ((offsetof(Session, npool) + sizeof(int) + 7) & ~(size_t)7)
 
 static char g_progress_path[MAX_PATH * 3];
 
@@ -409,8 +418,8 @@ static void progress_load(App *a)
 	char *buf = read_file(g_progress_path, &sz);
 	if (!buf) return;
 	const ProgressFile *pf = (const ProgressFile *)buf;
-	size_t ss = sz >= PROGRESS_HEAD ? pf->session_size : 0;   /* 新档 sizeof(Session)，旧档没有词池 */
-	if ((ss == sizeof(Session) || ss == SESSION_SIZE_OLD) && sz == (long)(PROGRESS_HEAD + 2 * (ss + 8)) &&
+	size_t ss = sz >= PROGRESS_HEAD ? pf->session_size : 0;   /* 新档 sizeof(Session)，旧档见上 */
+	if ((ss == sizeof(Session) || ss == SESSION_SIZE_V2 || ss == SESSION_SIZE_OLD) && sz == (long)(PROGRESS_HEAD + 2 * (ss + 8)) &&
 	    pf->magic == PROGRESS_MAGIC && pf->nwords > 0 && pf->nwords <= a->wl.n && (pf->dir == DIR_CN2EN || pf->dir == DIR_EN2CN)) {
 		a->dir = (Dir)pf->dir;
 		for (int i = 0; i < 2; i++) {
@@ -419,6 +428,8 @@ static void progress_load(App *a)
 			int32_t        stat[2];
 			memset(&d->s, 0, sizeof d->s);
 			memcpy(&d->s, rec, ss);
+			if (ss < sizeof(Session))   /* 旧档的末尾填充会盖到 hits[0] 上：新加的字段一律清零 */
+				memset((char *)&d->s + offsetof(Session, hits), 0, sizeof(Session) - offsetof(Session, hits));
 			memcpy(stat, rec + ss, sizeof stat);
 			d->answered = stat[0];
 			d->correct  = stat[1];
