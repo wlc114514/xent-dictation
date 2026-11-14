@@ -18,32 +18,39 @@
 
 ## 源码结构
 
-| 文件 | 职责 |
+| 路径 | 职责 |
 |---|---|
-| dictation.c | 消息处理、窗口和入口 |
-| dict_app.h | 前端模型和消息 |
-| dict_view.c | 导航和各页面视图 |
-| dict_session.c / .h | 普通轮次与无尽模式状态机 |
-| dict_words.c / .h | 词库读写、批量导入 |
-| dict_text.c / .h | 字面判分、提示和文本工具 |
-| dict_judge.c / .h | 本地模型判分 |
+| src/dictation.c | 消息处理（update）、后台判分 / 合并线程、加词窗口、入口 |
+| src/dict_app.h | 前端模型和消息 |
+| src/dict_view.c | 导航和各页面视图 |
+| src/dict_session.c / .h | 普通轮次与无尽模式状态机 |
+| src/dict_words.c / .h | 词库读写、批量导入 |
+| src/dict_text.c / .h | 字面判分、提示和文本工具 |
+| src/dict_judge.c / .h | 本地模型判分 |
 | tests/test_dict_core.c | 后端测试 |
+| samples/ | 数据文件示例（*.sample.json） |
+| tools/jev2b_server.py | 2B 判分模型的本地服务 |
+
+## 下载
+
+[Releases](../../releases) 里有打包好的 `xent-dictation-<版本>-x86_64.zip` / `-arm64.zip`：解压后把 samples 里的示例复制到 dictation.exe 旁边、去掉 `.sample` 即可运行。
+
+发版：推 `v*` 标签，`.github/workflows/release.yml` 用 llvm-mingw 构建两种架构，跑后端测试和布局自检，打包上传到 Release。
 
 ## 构建
 
-需要 Windows、Visual Studio 2022 C++ 桌面开发工具和 xmake 3.x。
-将 [fluxent](https://github.com/Project-Xent/fluxent)、[xent-kit](https://github.com/Project-Xent/xent-kit)、[xent-core](https://github.com/Project-Xent/xent-core)、[cwinrt](https://github.com/Project-Xent/cwinrt) 放在同级目录。
-
-1. 将本仓库的 examples/dictation 整个目录复制到 fluxent/examples/dictation。
-2. 将 xmake-targets.lua 中的三个目标追加到 fluxent/xmake.lua；已有同名目标时替换。
-3. 在 fluxent 目录运行：
+需要 Windows、[llvm-mingw](https://github.com/mstorsjo/llvm-mingw)（在 PATH 上）和 xmake 3.x。
 
 ```bat
-xmake build dictation
+xmake
 ```
 
-产物：fluxent/build/windows/x64/release/dictation.exe。
-应用使用 Fluxent 内部运行时接口，构建目标需要 include、src、src/bridge 头文件路径；框架升级可能需要调整这些接口。
+第一次配置时 xmake 从 [fluxent v0.3.2 发布页](https://github.com/Project-Xent/fluxent/releases/tag/v0.3.2) 下载
+`xent-0.3.2-<arch>-windows-gnu.zip`（公开头文件 + 合并的 libxent.a，校验 sha256），不需要再把框架源码放在旁边。
+只用 Xent 的公开接口：`flux_run` 装配窗口和运行时，后台线程用 `flux_app_post` 把消息投回 UI 线程。
+
+产物：build/mingw/x86_64/release/dictation.exe。ARM64：`xmake f -a arm64 && xmake`。
+离线构建：把发布包 zip 放进某个目录，`xmake f --pkg_searchdirs=<目录>`。
 
 ## 数据
 
@@ -74,20 +81,17 @@ dictation_judge.json 配置可选的本地判分器。仓库提供 *.sample.json
 一词多义默认要把每个意思都写出来；练习页右上角取消勾选「多义词全答」后，答出任意一个意思就算对。开关保存在 dictation_settings.json。
 本地词库与判分配置不纳入版本控制。
 
-run-dictation.bat 是启动脚本示例，修改其中 exe 路径后使用。
+本地开发用 `xmake run dictation`，数据文件放在仓库根目录（已在 .gitignore 里）。
 
 ## 检查
 
-在 fluxent 目录运行：
-
 ```bat
-xmake build test_dict_core
-xmake run test_dict_core
+xmake test
 xmake build test_dict_layout
-xmake run test_dict_layout
+set STAGE=5 && xmake run test_dict_layout
 ```
 
-布局检查只测量页面内容；导航外壳需要真实窗口后端。
+布局检查只测量页面内容；导航外壳和答题框（AutoSuggestBox）需要真实窗口，自检里答题框换成同尺寸的 TextBox。
 
 | 环境变量 | 页面 |
 |---|---|

@@ -38,11 +38,11 @@ static XtkEl *page_header(XtkUi *ui, const char *title, const char *blurb, XtkEl
 {
 	return xtk_row(ui, (XtkStackDesc){.gap = 16, .align = XENT_FLEX_ALIGN_CENTER, .justify = XENT_FLEX_JUSTIFY_SPACE_BETWEEN, .fill = true},
 	    xtk_kids(
-	        xtk_shrink(xtk_column(ui, (XtkStackDesc){.gap = 6},
+	        xtk_column(ui, (XtkStackDesc){.gap = 6},
 	            xtk_kids(
 	                xtk_text(ui, title, (XtkTextDesc){.size = 28, .weight = XTK_FONT_SEMI_BOLD}),
-	                blurb ? body(ui, blurb) : NULL)), 1.0f),
-	        trailing ? xtk_shrink(xtk_row(ui, (XtkStackDesc){0}, xtk_kids(trailing)), 0.0f) : NULL));   /* 控件不接受伸缩属性，套一层 */
+	                blurb ? body(ui, blurb) : NULL)),
+	        trailing));
 }
 
 /* 带标题的分区卡片 */
@@ -74,9 +74,10 @@ static XtkEl *feedback_bar(XtkUi *ui, const Feedback *fb, XtkMsg close)
 static XtkEl *scroll_page(XtkUi *ui, Page p, XtkEl *content)
 {
 	return xtk_grow(xtk_keyed(ui, xtk_fmt(ui, "page-%d", p),
-	    xtk_scroll(ui, xtk_kids(
-	        xtk_shrink(xtk_column(ui, (XtkStackDesc){.padding = {36, 28, 36, 28}, .align = XENT_FLEX_ALIGN_STRETCH},
-	            xtk_kids(content)), 0.0f)))), 1.0f);   /* 长内容不能被压到视口高度 */
+	    xtk_scroll(ui, (XtkScrollDesc){.x = NAN, .y = NAN},   /* 不受控：滚动位置交给控件自己 */
+	        xtk_kids(
+	            xtk_column(ui, (XtkStackDesc){.padding = {36, 28, 36, 28}, .align = XENT_FLEX_ALIGN_STRETCH},
+	                xtk_kids(content))))), 1.0f);
 }
 
 /* 练习页：不滚动，卡片撑满剩余高度 */
@@ -101,7 +102,7 @@ static XtkEl *word_row(XtkUi *ui, int no, const Word *w)
 	        cell(ui, caption(ui, xtk_fmt(ui, "%d", no)), 36),
 	        cell(ui, xtk_text(ui, w->word, (XtkTextDesc){.size = 15, .weight = XTK_FONT_SEMI_BOLD}), 190),
 	        cell(ui, caption(ui, w->pos), 72),
-	        xtk_shrink(xtk_grow(xtk_column(ui, (XtkStackDesc){0}, xtk_kids(xtk_text(ui, w->meaning, (XtkTextDesc){.size = 14}))), 1.0f), 1.0f)));
+	        xtk_grow(xtk_column(ui, (XtkStackDesc){0}, xtk_kids(xtk_text(ui, w->meaning, (XtkTextDesc){.size = 14}))), 1.0f)));
 }
 
 /* 虚拟化词表：只构建视口里看得见的几行，词再多也不卡 */
@@ -124,6 +125,21 @@ static XtkEl *word_list(XtkUi *ui, ListEnv *env, int n)
 
 /* ================================================================== */
 /* 练习页（普通模式 / 无尽模式共用）                                    */
+/* ================================================================== */
+
+/* 答题框。TextBox 没有回车事件；AutoSuggestBox 不给建议、不给查询图标就是普通输入框，回车发 query。
+ * AutoSuggestBox 要真实窗口才建得出来，无头布局自检换成同尺寸的 TextBox。 */
+static XtkEl *answer_box(XtkUi *ui, const char *placeholder, const char *content, bool disabled)
+{
+#ifdef DICT_LAYOUT_TEST
+	return xtk_textbox(ui, placeholder, (XtkTextBoxDesc){.content = content, .disabled = disabled, .change = xtk_msg(MSG_ANSWER)});
+#else
+	return xtk_suggest(ui, placeholder, (XtkAutoSuggestDesc){.content = content, .disabled = disabled,
+	                                                         .on_text = xtk_msg(MSG_ANSWER), .query = xtk_msg(MSG_ENTER)});
+#endif
+}
+
+/* ================================================================== */
 /* ================================================================== */
 
 static const XtkSelectorItem DIR_ITEMS[] = {
@@ -264,9 +280,8 @@ static XtkEl *view_drill(XtkUi *ui, App *a, Drill *d, bool endless)
 	/* —— 输入 —— */
 	XtkEl *input = xtk_row(ui, (XtkStackDesc){.gap = 8, .align = XENT_FLEX_ALIGN_STRETCH, .justify = XENT_FLEX_JUSTIFY_CENTER},
 	    xtk_kids(
-	        xtk_sized(xtk_textbox(ui, (a->dir == DIR_EN2CN) ? "写出中文释义，回车提交" : "写出英文单词，回车提交",
-	            (XtkTextBoxDesc){.content = a->answer, .change = xtk_msg(MSG_ANSWER), .submit = xtk_msg(MSG_ENTER),
-	                             .disabled = !asking || busy}), 380, 36),
+	        xtk_sized(answer_box(ui, (a->dir == DIR_EN2CN) ? "写出中文释义，回车提交" : "写出英文单词，回车提交",
+	                             a->answer, !asking || busy), 380, 36),
 	        asking ? xtk_button(ui, "提交", (XtkButtonDesc){.style = XTK_BUTTON_ACCENT, .icon = "Accept", .disabled = busy,
 	                                                     .click = xtk_msg(MSG_SUBMIT)}) : NULL));
 

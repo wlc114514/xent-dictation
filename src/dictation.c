@@ -12,12 +12,8 @@
  *   · dict_text.c    —— 判分规则、首字母提示、JSON
  *   · dict_judge.c   —— 本地 JEV 小模型判分（在后台线程跑，不卡界面）
  */
-#include <fluxent/fluxent.h>
-#include <fluxent/flux_app.h>
-#include <fluxent/flux_host.h>
-
-#include "flux_internal.h"          /* FluxBackendCtx / flux_xtk_runtime_config */
-#include "render/flux_dl_replay.h"  /* flux_xtk_backend_create */
+#include <fluxent/fluxent.h>   /* 只用 Xent 0.3.2 的公开接口 */
+#include <fluxent/flux_node_store.h>
 
 #include <windows.h>
 #include <dwmapi.h>
@@ -34,9 +30,9 @@
 #include "dict_app.h"
 #include "dict_text.h"
 
-static App    g_app;
-static XtkRt *g_rt;        /* 运行时：给后台线程 / 加词窗口回投消息用 */
-static HWND   g_bridge;    /* 跨线程投递消息的隐藏窗口 */
+static App      g_app;
+static FluxApp *g_fapp;                      /* 运行中的应用（on_start 到 on_stop 之间），回投消息用 */
+static SRWLOCK  g_fapp_lock = SRWLOCK_INIT;  /* 后台线程投递 vs 退出时清空 g_fapp */
 
 Drill *app_drill(App *a)
 {
@@ -105,42 +101,24 @@ static const char *answer_text(const App *a, int idx, char *buf, size_t cap)
 }
 
 /* ================================================================== */
-/* 跨线程消息桥：后台线程 PostMessage → UI 线程 xtk_rt_post            */
+/* 跨线程投递：flux_app_post 可在任意线程调用，消息到 UI 线程再交给 update */
 /* ================================================================== */
 
-#define WM_BRIDGE_JUDGED (WM_APP + 1)
-#define WM_BRIDGE_POST   (WM_APP + 2)
-#define WM_BRIDGE_MERGE  (WM_APP + 3)   /* wp = 消息号；进度：lp 高 32 位已查、低 32 位总数；结束：lp = MergeJob* */
-
-static LRESULT CALLBACK bridge_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+/* 程序已退出（或无头自检没有应用）时丢弃，返回 false */
+static bool ui_post(XtkMsg msg)
 {
-	if (!g_rt) return DefWindowProcW(h, msg, wp, lp);
-	if (msg == WM_BRIDGE_JUDGED) {
-		/* wp 低 32 位 = 请求号，高 32 位 = 判为意思接近的义项位掩码（只有一个义项时是 bit 0；义项不超过 16 个，float 装得下） */
-		xtk_rt_post(g_rt, (XtkMsg){.tag = MSG_JUDGED, .i = (int32_t)(uint32_t)wp, .f = (float)(uint32_t)((uint64_t)wp >> 32),
-		                           .d = (double)(LONG_PTR)lp / 1e6});
-		return 0;
-	}
-	if (msg == WM_BRIDGE_POST) {
-		xtk_rt_post(g_rt, (XtkMsg){.tag = (int32_t)wp});
-		return 0;
-	}
-	if (msg == WM_BRIDGE_MERGE) {
-		if (wp == MSG_MERGE_DONE) xtk_rt_post(g_rt, (XtkMsg){.tag = MSG_MERGE_DONE, .ptr = (void *)lp});
-		else xtk_rt_post(g_rt, (XtkMsg){.tag = MSG_MERGE_PROGRESS, .i = (int32_t)((uint64_t)lp >> 32), .f = (float)(uint32_t)lp});
-		return 0;
-	}
-	return DefWindowProcW(h, msg, wp, lp);
+	AcquireSRWLockShared(&g_fapp_lock);
+	bool ok = g_fapp && flux_app_post(g_fapp, msg) == XTK_POST_ACCEPTED;
+	ReleaseSRWLockShared(&g_fapp_lock);
+	return ok;
 }
 
-static void bridge_create(void)
+static bool ui_ready(void)
 {
-	WNDCLASSW wc     = {0};
-	wc.lpfnWndProc   = bridge_proc;
-	wc.hInstance     = GetModuleHandleW(NULL);
-	wc.lpszClassName = L"DictBridge";
-	RegisterClassW(&wc);
-	g_bridge = CreateWindowExW(0, L"DictBridge", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL);
+	AcquireSRWLockShared(&g_fapp_lock);
+	bool ok = g_fapp != NULL;
+	ReleaseSRWLockShared(&g_fapp_lock);
+	return ok;
 }
 
 /* ================================================================== */
@@ -188,16 +166,16 @@ static DWORD WINAPI judge_thread(LPVOID param)
 		}
 	}
 done:;
-	double   p  = hit ? worst_hit : best;
-	WPARAM   wp = (WPARAM)(((uint64_t)hit << 32) | (uint32_t)job->seq);
-	PostMessageW(g_bridge, WM_BRIDGE_JUDGED, wp, (LPARAM)(LONG_PTR)llround(p * 1e6));
+	double p = hit ? worst_hit : best;
+	/* .f = 判为意思接近的义项位掩码（只有一个义项时是 bit 0；义项不超过 16 个，float 装得下） */
+	ui_post((XtkMsg){.tag = MSG_JUDGED, .i = job->seq, .f = (float)hit, .d = p});
 	free(job);
 	return 0;
 }
 
 static bool start_judging(App *a, Drill *d, const Word *w)
 {
-	if (!judge_enabled(a->judge) || !g_bridge || is_blank(a->answer)) return false;
+	if (!judge_enabled(a->judge) || !ui_ready() || is_blank(a->answer)) return false;
 	JudgeJob *job = (JudgeJob *)calloc(1, sizeof *job);
 	if (!job) return false;
 	job->judge = a->judge;
@@ -575,7 +553,7 @@ static volatile LONG g_quit;   /* 程序退出：合并线程别再发请求 */
 
 static void merge_post_progress(int done, int total)
 {
-	PostMessageW(g_bridge, WM_BRIDGE_MERGE, MSG_MERGE_PROGRESS, (LPARAM)(((uint64_t)done << 32) | (uint32_t)total));
+	ui_post((XtkMsg){.tag = MSG_MERGE_PROGRESS, .i = done, .f = (float)total});
 }
 
 static DWORD WINAPI merge_thread(LPVOID param)
@@ -610,7 +588,7 @@ static DWORD WINAPI merge_thread(LPVOID param)
 		if (!job->failed && !senses_merge(sn, ns, link, it->merged, sizeof it->merged)) it->merged[0] = 0;
 	}
 out:
-	PostMessageW(g_bridge, WM_BRIDGE_MERGE, MSG_MERGE_DONE, (LPARAM)job);
+	if (!ui_post((XtkMsg){.tag = MSG_MERGE_DONE, .ptr = job})) free(job);   /* 已退出：没人收了 */
 	return 0;
 }
 
@@ -618,7 +596,7 @@ out:
 static bool start_merge(App *a, int from, int to, const char *intro)
 {
 	double thr = judge_merge_threshold(a->judge);
-	if (thr <= 0 || a->merging || !g_bridge) return false;
+	if (thr <= 0 || a->merging || !ui_ready()) return false;
 	char sn[DICT_MAX_SENSES][DICT_SENSE_LEN];
 	int  n = 0;
 	for (int i = from; i < to; i++) n += split_senses(a->wl.words[i].meaning, sn, DICT_MAX_SENSES) > 1;
@@ -862,7 +840,7 @@ static void add_dialog_submit(AddDialog *d)
 		free(u8);
 	}
 	free(wbuf);
-	PostMessageW(g_bridge, WM_BRIDGE_POST, MSG_ADD_DONE, 0);   /* 让主界面刷新提示 */
+	ui_post((XtkMsg){.tag = MSG_ADD_DONE});   /* 让主界面刷新提示 */
 	DestroyWindow(d->hwnd);
 }
 
@@ -965,7 +943,7 @@ static void show_add_dialog(App *a)
 	d->app    = a;
 	g_add_dlg = d;
 
-	HWND parent = FindWindowW(L"FluxentWindowClass", NULL);
+	HWND parent = g_fapp ? flux_app_hwnd(g_fapp) : NULL;
 	int  dpi    = parent ? (int)GetDpiForWindow(parent) : 96;
 	int  w = MulDiv(640, dpi, 96), h = MulDiv(560, dpi, 96), x = CW_USEDEFAULT, y = CW_USEDEFAULT;
 	if (parent) {
@@ -1044,68 +1022,22 @@ static void app_init(App *a, const char *words_path, const char *judge_path)
 
 #ifndef DICT_LAYOUT_TEST
 
-/* 框架的 .integrate_window = true 在本机仍会留一条系统标题栏（顶部两组最小化/
- * 最大化/关闭）。等窗口真正显示出来再摘掉 WS_CAPTION——太早改样式会打断显示流程。 */
-static DWORD WINAPI caption_fix_thread(LPVOID unused)
+/* flux_run 建好窗口和运行时之后、进消息循环之前（标题栏由 NavigationView 的 TitleBar 并入窗口） */
+static void on_start(FluxApp *app, void *user)
 {
-	(void)unused;
-	for (int i = 0; i < 600; i++) {
-		HWND h = FindWindowW(L"FluxentWindowClass", NULL);
-		if (h && IsWindowVisible(h)) {
-			LONG_PTR st = GetWindowLongPtrW(h, GWL_STYLE);
-			if (st & WS_CAPTION) {
-				SetWindowLongPtrW(h, GWL_STYLE, st & ~(LONG_PTR)WS_CAPTION);
-				SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-			}
-			return 0;
-		}
-		Sleep(15);
-	}
-	return 1;
+	(void)user;
+	AcquireSRWLockExclusive(&g_fapp_lock);
+	g_fapp = app;
+	ReleaseSRWLockExclusive(&g_fapp_lock);
 }
 
-static void frame_cb(void *ctx) { xtk_rt_frame((XtkRt *)ctx); }
-
-/* DICT_DIAG=1 时把失败的帧记进 dictation_diag.log（排查界面不显示用） */
-static void on_diagnostic(void *ctx, XtkFrameResult const *r)
+/* 消息循环结束、应用销毁之前：之后后台线程的投递一律丢弃 */
+static void on_stop(FluxApp *app, void *user)
 {
-	(void)ctx;
-	if (r->status == XTK_FRAME_CLEAN || r->status == XTK_FRAME_COMMITTED || r->status == XTK_FRAME_DEFERRED) return;
-	FILE *f = fopen("dictation_diag.log", "a");
-	if (!f) return;
-	fprintf(f, "frame status=%d batch.error=%d op=%u identity.error=%d\n", (int)r->status,
-	        (int)r->diagnostic.error, r->diagnostic.failed_op, (int)r->identity.error);
-	fclose(f);
-}
-
-/* 与框架的 flux_run() 相同的装配，只是把运行时留在 g_rt，好让后台线程回投消息 */
-static int app_run(const FluxAppCfg *cfg, App *a)
-{
-	FluxApp *app = flux_app_create(cfg);
-	if (!app) return 1;
-	FluxBackendCtx bctx = {.ctx = flux_app_ctx(app), .store = flux_app_store(app), .app = app};
-	int rc = 1;
-
-	bctx.host = flux_host_adopt(bctx.ctx, bctx.store, flux_app_root(app));
-	XtkBackend *backend = bctx.host ? flux_xtk_backend_create(&bctx, bctx.host) : NULL;
-	if (backend) {
-		flux_app_sethost(app, bctx.host, backend);
-		XtkRtCfg rt_cfg = flux_xtk_runtime_config(&bctx);
-		const char *diag = getenv("DICT_DIAG");
-		if (diag && *diag == '1') rt_cfg.on_diagnostic = on_diagnostic;
-		bctx.runtime    = xtk_rt_create(bctx.host, &rt_cfg, flux_app_root(app), a, update, app_view);
-		if (bctx.runtime) {
-			g_rt = bctx.runtime;
-			flux_app_onframe(app, frame_cb, bctx.runtime);
-			rc = flux_app_run(app);
-			flux_app_onframe(app, NULL, NULL);
-			g_rt = NULL;
-		}
-	}
-	if (bctx.runtime && !xtk_rt_destroy(bctx.runtime)) rc = 1;
-	if (bctx.host) flux_host_destroy(bctx.host);
-	flux_app_destroy(app);
-	return rc;
+	(void)app; (void)user;
+	AcquireSRWLockExclusive(&g_fapp_lock);
+	g_fapp = NULL;
+	ReleaseSRWLockExclusive(&g_fapp_lock);
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int showCmd)
@@ -1125,7 +1057,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int showCmd)
 
 	App *a = &g_app;
 	app_init(a, words_path, judge_path);
-	bridge_create();
 
 	/* 截图/回归用：DICT_START_PAGE=1/3/4 直接打开无尽模式/词库/说明 */
 	const char *env = getenv("DICT_START_PAGE");
@@ -1134,17 +1065,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int showCmd)
 		if (p > 0 && p < PAGE_COUNT && p != PAGE_SEP) a->page = (Page)p;
 	}
 
-	HANDLE th = CreateThread(NULL, 0, caption_fix_thread, NULL, 0, NULL);
-	if (th) CloseHandle(th);
-
 	FluxAppCfg cfg = {
-	    .title     = L"单词默写",
-	    .width     = 1080,
-	    .height    = 780,
-	    .dark_mode = a->dark,
-	    .backdrop  = FLUX_BACKDROP_MICA,
+	    .title    = L"单词默写",
+	    .width    = 1080,
+	    .height   = 780,
+	    .theme    = FLUX_THEME_SYSTEM,   /* 窗口框架和控件都跟随系统 */
+	    .backdrop = FLUX_BACKDROP_MICA,
+	    .on_start = on_start,
+	    .on_stop  = on_stop,
 	};
-	int rc = app_run(&cfg, a);
+	int rc = flux_run(&cfg, a, update, app_view);
 
 	progress_save(a);
 	InterlockedExchange(&g_quit, 1);
@@ -1218,11 +1148,8 @@ int main(void)
 	xent_setflexdir(ctx, host, XENT_FLEX_COLUMN);
 	xent_setitems(ctx, host, XENT_FLEX_ALIGN_STRETCH);
 
-	FluxBackendCtx bctx = {.ctx = ctx, .store = store};
-	bctx.host           = flux_host_adopt(ctx, store, host);
-	XtkRtCfg tcfg       = flux_xtk_runtime_config(&bctx);
-	XtkRt   *rt         = xtk_rt_create(bctx.host, &tcfg, host, a, update, app_page);   /* 导航外壳要真实后端，这里只量页面 */
-	bctx.runtime        = rt;
+	XtkHost *xhost = flux_host_adopt(ctx, store, host);
+	XtkRt   *rt    = xtk_rt_create(xhost, &(XtkRtCfg){0}, host, a, update, app_page);   /* 导航外壳要真实后端，这里只量页面 */
 	XtkFrameResult fr = xtk_rt_frame(rt);
 	printf("frame status=%d identity.error=%d batch.error=%d op=%u\n", (int)fr.status, (int)fr.identity.error,
 	       (int)fr.diagnostic.error, fr.diagnostic.failed_op);
@@ -1230,7 +1157,7 @@ int main(void)
 	dump_node(ctx, xtk_rt_root(rt), "root", 0);
 
 	xtk_rt_destroy(rt);
-	flux_host_destroy(bctx.host);
+	flux_host_destroy(xhost);
 	flux_store_destroy(store);
 	flux_text_destroy(txt);
 	xent_ctx_destroy(ctx);

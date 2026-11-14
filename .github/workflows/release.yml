@@ -1,0 +1,103 @@
+name: release
+
+# 推 v* 标签：用 llvm-mingw 构建 x86_64 + arm64，x86_64 上跑后端测试和布局自检，
+# 打包成 xent-dictation-<版本>-<arch>.zip 挂到 GitHub Release。
+# Xent SDK 由 xmake.lua 里的 package("xent") 从 fluxent 发布页下载（校验 sha256）。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Setup llvm-mingw
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
+          $rel = Invoke-RestMethod https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest -Headers $headers
+          $asset = $rel.assets | Where-Object { $_.name -like 'llvm-mingw-*-ucrt-x86_64.zip' } | Select-Object -First 1
+          Invoke-WebRequest $asset.browser_download_url -OutFile llvm-mingw.zip
+          Expand-Archive llvm-mingw.zip -DestinationPath C:\ -Force
+          $root = (Get-ChildItem 'C:\llvm-mingw-*' -Directory | Select-Object -First 1).FullName
+          "LLVM_MINGW=$root" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+          "$root\bin"        | Out-File -Append -Encoding ascii $env:GITHUB_PATH
+
+      - name: Configure
+        shell: pwsh
+        run: xmake f -p mingw -a ${{ matrix.arch }} --mingw="$env:LLVM_MINGW" -m release -y
+
+      - name: Build
+        run: xmake build -a
+
+      - name: Test
+        if: matrix.arch == 'x86_64'
+        shell: pwsh
+        run: |
+          xmake test
+          foreach ($stage in 5, 8, 12, 13, 14, 15) {
+            $env:STAGE = "$stage"
+            $out = xmake run test_dict_layout | Out-String
+            if ($out -notmatch 'frame status=1 identity\.error=0 batch\.error=0') {
+              Write-Output $out
+              throw "layout self-check failed at STAGE=$stage"
+            }
+          }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = '${{ github.ref_name }}' -replace '^v', ''
+          if ($ver -notmatch '^\d') { $ver = 'dev' }
+          $name = "xent-dictation-$ver-${{ matrix.arch }}"
+          $dir  = "dist\$name"
+          New-Item -ItemType Directory -Force $dir, "$dir\samples", "$dir\tools" | Out-Null
+          Copy-Item "build\mingw\${{ matrix.arch }}\release\dictation.exe" $dir
+          Copy-Item README.md, LICENSE $dir
+          Copy-Item samples\*.sample.json "$dir\samples"
+          Copy-Item tools\jev2b_server.py "$dir\tools"
+          Compress-Archive -Path "$dir\*" -DestinationPath "dist\$name.zip" -Force
+          "ZIP=dist\$name.zip" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dictation-${{ matrix.arch }}
+          path: ${{ env.ZIP }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/*.zip --generate-notes --title "$TAG" -R "$GITHUB_REPOSITORY"
+          fi
