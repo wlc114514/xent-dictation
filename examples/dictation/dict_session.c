@@ -163,11 +163,18 @@ int sess_endless_passed(const Session *s)
 	return s->phase == SP_DONE ? sess_endless_total(s) : s->gend - s->qlen;
 }
 
-/* 当前词一次答对满次数 → 移出本组（后面的词顶上来，pos 不动），再从没进过组的词里补满 */
+int sess_total_hits(const Session *s)
+{
+	int n = 0;
+	for (int i = 0; i < s->nwords && i < DICT_MAX_WORDS; i++) n += s->hits[i];
+	return n;
+}
+
+/* 当前词一次答对满次数（答对时已经计上）→ 移出本组（后面的词顶上来，pos 不动），再从没进过组的词里补满 */
 static bool endless_retire(Session *s)
 {
 	int w = s->queue[s->pos];
-	if (s->fumbled || ++s->hits[w] < ENDLESS_RETIRE_HITS) return false;
+	if (s->hits[w] < ENDLESS_RETIRE_HITS) return false;
 
 	if (s->pos + 1 > s->seen) s->seen = s->pos + 1;
 	s->seen--;   /* 它本来算见过 */
@@ -260,6 +267,8 @@ void sess_answer(Session *s, bool correct)
 	if (s->phase != SP_ASKING && s->phase != SP_WRONG) return;
 	if (correct) {
 		s->phase = SP_CORRECT;
+		if (s->kind == SESS_ENDLESS && !s->fumbled) s->hits[s->queue[s->pos]]++;   /* 一次答对：马上计上 */
+		s->fumbled = 1;   /* 这题已经计过（或答错过）：换题型再答一遍不重复计 */
 	} else {
 		s->phase   = SP_WRONG;             /* 提交答错只允许重试；「不知道」才公布答案并重开 */
 		s->fumbled = 1;

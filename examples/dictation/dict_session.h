@@ -81,7 +81,7 @@ typedef struct Session {
 
 	/* 无尽模式「一次答对满 15 次就移出」。同样放在末尾：2026-11-14 前的存档读进来全是 0 */
 	int hits[DICT_MAX_WORDS];   /* 每个词（词表下标）一次答对的次数 */
-	int fumbled;                /* 当前这题提交答错过（再答对不算一次答对） */
+	int fumbled;                /* 当前这题答错过或已经计过次数（再答对不计） */
 	int retired, joined;        /* 刚才 sess_next 移出的词 / 补进来的词（词表下标，没有是 -1） */
 } Session;
 
@@ -128,6 +128,9 @@ int  sess_ngroups(const Session *s);
 
 /* 无尽模式里一次答对满 ENDLESS_RETIRE_HITS 次、已经移出的词数 */
 int  sess_mastered(const Session *s);
+
+/* 无尽模式本次累计一次答对的次数（所有词 hits 之和，答对马上加 1） */
+int  sess_total_hits(const Session *s);
 
 /* 无尽模式已经过关的词数（之前的组 + 本组移出的） */
 int  sess_endless_passed(const Session *s);

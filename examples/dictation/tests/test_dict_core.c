@@ -542,6 +542,21 @@ static void test_endless_retire(void)
 	CHECK(S.gend == 21 && sess_ngroups(&S) == 3 && sess_mastered(&S) == 1 && sess_endless_passed(&S) == 1,
 	      "gend=%d ngroups=%d mastered=%d passed=%d", S.gend, sess_ngroups(&S), sess_mastered(&S), sess_endless_passed(&S));
 
+	CASE("对满 15 次：答对当场就计上；换题型再答一遍不重复计");
+	{
+		int c = sess_current(&S), h0 = S.hits[c], t0 = sess_total_hits(&S);
+		sess_answer(&S, true);
+		CHECK(S.hits[c] == h0 + 1 && sess_total_hits(&S) == t0 + 1, "答对后马上 +1：%d → %d", h0, S.hits[c]);
+		sess_reask(&S);
+		sess_answer(&S, true);
+		CHECK(S.hits[c] == h0 + 1, "换题型再答：%d", S.hits[c]);
+		sess_next(&S);
+		CHECK(S.hits[c] == h0 + 1, "点下一个不再加：%d", S.hits[c]);
+		sess_restart(&S);
+		for (int k = 0; k < 14; k++) { ok_next(&S); sess_dont_know(&S); sess_next(&S); }
+		ok_next(&S);   /* 回到上面「词 0 第 15 次后移出」的状态 */
+	}
+
 	CASE("对满 15 次：提交答错再答对不算一次答对；「不知道」不清零");
 	int cur = sess_current(&S), h = S.hits[cur];
 	sess_answer(&S, false);

@@ -310,7 +310,7 @@ static XtkEl *view_drill(XtkUi *ui, App *a, Drill *d, bool endless)
 	            stat_tile(ui, "当前组", xtk_fmt(ui, "%d / %d", s->group + 1, sess_ngroups(s))),
 	            stat_tile(ui, "本组已见过", xtk_fmt(ui, "%d / %d", s->seen > s->pos + 1 ? s->seen : s->pos + 1, s->qlen)),
 	            stat_tile(ui, "已过关的词", xtk_fmt(ui, "%d", sess_endless_passed(s))),
-	            stat_tile(ui, xtk_fmt(ui, "已掌握（对满 %d 次）", ENDLESS_RETIRE_HITS), xtk_fmt(ui, "%d", sess_mastered(s)))))
+	            stat_tile(ui, "累计一次答对", xtk_fmt(ui, "%d", sess_total_hits(s)))))
 	    : xtk_row(ui, (XtkStackDesc){.gap = 12, .align = XENT_FLEX_ALIGN_STRETCH, .fill = true},
 	        xtk_kids(
 	            stat_tile(ui, "已作答", xtk_fmt(ui, "%d", d->answered)),
