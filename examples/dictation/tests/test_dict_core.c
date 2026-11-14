@@ -238,6 +238,32 @@ static void test_words(void)
 	CHECK(words_load(&again, path) && again.n == 13 && !strcmp(again.words[0].meaning, "热情（热心）")
 	      && !strcmp(again.words[1].meaning, "公正 [法]"), "n=%d [%s]", again.n, again.words[0].meaning);
 
+	CASE("去掉单词表上的标注（忘记 / 少词义…）");
+	{
+		static const char *const T[][2] = {
+			{"忘记 获利丰厚的", "获利丰厚的"},
+			{"少词义 发展 精心设计的、复杂的、详尽的; 详细解释、发展", "精心设计的、复杂的、详尽的; 详细解释、发展"},
+			{"获利丰厚的 （忘了）", "获利丰厚的"},
+			{"遗忘、记不住 毁灭", "毁灭"},
+			{"少词义 解决、分辨", "解决、分辨"},
+			{"忘记", "忘记"},                 /* forget：只有这一个意思，不动 */
+			{"忘记、遗忘", "忘记、遗忘"},       /* 都是标注词、没有别的义项 */
+			{"遗忘、忘却", "遗忘、忘却"},       /* oblivion：其他义项也跟「忘」沾边 */
+			{"健忘的 忘记", "健忘的 忘记"},
+			{"复杂难懂得", "复杂难懂得"},
+			{"错觉", "错觉"},
+		};
+		for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
+			char m[DICT_MAX_MEANING];
+			snprintf(m, sizeof m, "%s", T[i][0]);
+			strip_notes(m);
+			CHECK(!strcmp(m, T[i][1]), "[%s] → [%s]，应为 [%s]", T[i][0], m, T[i][1]);
+		}
+		words_add_text(&WL, "lucrative adj. 忘记 获利丰厚的\n", &st);
+		CHECK(st.added == 1 && !strcmp(WL.words[WL.n - 1].meaning, "获利丰厚的"), "录入时去标注：[%s]",
+		      WL.words[WL.n - 1].meaning);
+	}
+
 	CASE("清空");
 	words_clear(&WL);
 	CHECK(WL.n == 0 && u8_fopen(path, "rb") == NULL, "清空后文件应被删除");

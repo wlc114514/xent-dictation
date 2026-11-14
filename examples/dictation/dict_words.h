@@ -49,5 +49,9 @@ bool words_save(const WordList *wl);
 /* 清空：删除词表文件、内存清零 */
 void words_clear(WordList *wl);
 
+/* 去掉单词表上的标注：「忘记 获利丰厚的」→「获利丰厚的」，「少词义 发展 精心设计的、发展」→「精心设计的、发展」。
+ * 只删跟其他义项不沾边的（forget「忘记、遗忘」不动）。录入时自动调用；删了返回 true。 */
+bool strip_notes(char *meaning);
+
 /* "n. 过程 v. 处理" → pos="n. v."、meaning="过程 处理"（规则同 Python 版） */
 void split_pos_meaning(const char *rest, char *pos, size_t pc, char *meaning, size_t mc);

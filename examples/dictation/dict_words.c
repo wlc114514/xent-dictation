@@ -342,12 +342,125 @@ static int split_lines(char *buf, char **lines, int max)
 	return n;
 }
 
+/* ================================================================== */
+/* 单词表上的标注（「忘记」「少词义」…）                               */
+/* ================================================================== */
+
+/* key：判断「跟其他词义近不近」用 —— 其他义项里也有 key，说明这个词本身就是这个意思 */
+static const struct { const char *note, *key; } NOTES[] = {
+	{"忘", "忘"}, {"忘记", "忘"}, {"忘了", "忘"}, {"又忘", "忘"}, {"又忘了", "忘"}, {"遗忘", "忘"},
+	{"记不住", "记"}, {"没记住", "记"}, {"不记得", "记"}, {"记不清", "记"}, {"想不起", "想不起"}, {"想不起来", "想不起"},
+	{"少词义", "词义"}, {"缺词义", "词义"}, {"漏词义", "词义"}, {"少了词义", "词义"}, {"词义不全", "词义"},
+	{"少释义", "释义"}, {"缺释义", "释义"}, {"漏释义", "释义"},
+	{"少义", "少义"}, {"漏义", "漏义"}, {"缺义", "缺义"}, {"少意思", "意思"}, {"漏意思", "意思"},
+	{NULL, NULL}
+};
+
+/* 义项之间的分隔：空格、、，,;；/ —— 返回分隔符字节数，不是返回 0 */
+static int note_sep(const char *s)
+{
+	static const char *const S[] = {" ", "\t", "、", "，", ",", ";", "；", "/", NULL};
+	for (int i = 0; S[i]; i++)
+		if (strncmp(s, S[i], strlen(S[i])) == 0) return (int)strlen(S[i]);
+	return 0;
+}
+
+/* [s, e) 去掉外层括号后是不是标注；是的话返回 NOTES 下标，否则 -1 */
+static int note_of(const char *s, const char *e)
+{
+	static const char *const OPEN[]  = {"（", "(", "【", "[", NULL};
+	static const char *const CLOSE[] = {"）", ")", "】", "]", NULL};
+	for (int i = 0; OPEN[i]; i++) {
+		size_t lo = strlen(OPEN[i]), lc = strlen(CLOSE[i]);
+		if ((size_t)(e - s) > lo + lc && strncmp(s, OPEN[i], lo) == 0 && strncmp(e - lc, CLOSE[i], lc) == 0) {
+			s += lo;
+			e -= lc;
+			break;
+		}
+	}
+	for (int i = 0; NOTES[i].note; i++)
+		if (strlen(NOTES[i].note) == (size_t)(e - s) && strncmp(s, NOTES[i].note, (size_t)(e - s)) == 0) return i;
+	return -1;
+}
+
+static bool span_has(const char *s, const char *e, const char *key)
+{
+	size_t L = strlen(key);
+	for (const char *p = s; p + L <= e; p++)
+		if (strncmp(p, key, L) == 0) return true;
+	return false;
+}
+
+bool strip_notes(char *meaning)
+{
+	enum { MAXT = 64 };
+	struct { const char *s, *e; int note; bool del; } t[MAXT];
+	int nt = 0;
+	for (const char *p = meaning; *p && nt < MAXT;) {
+		int k = note_sep(p);
+		if (k) { p += k; continue; }
+		const char *s = p;
+		while (*p && !note_sep(p)) p++;
+		t[nt].s = s, t[nt].e = p, t[nt].note = note_of(s, p), t[nt].del = false;
+		nt++;
+	}
+
+	/* 删：是标注，且剩下的真义项里没有跟它沾边的（一个真义项都没有就不删 —— 那是这个词本身的意思） */
+	bool any = false;
+	for (int i = 0; i < nt; i++) {
+		if (t[i].note < 0) continue;
+		bool real = false, near = false;
+		for (int j = 0; j < nt; j++) {
+			if (t[j].note >= 0) continue;
+			real = true;
+			if (span_has(t[j].s, t[j].e, NOTES[t[i].note].key)) near = true;
+		}
+		if (real && !near) t[i].del = any = true;
+	}
+	if (!any) return false;
+
+	/* 「少词义 发展 …、发展」：标注后面紧跟的是补记的义项，后面已经有了就一起删 */
+	for (int i = 0; i + 1 < nt; i++) {
+		if (!t[i].del || t[i + 1].note >= 0) continue;
+		size_t L = (size_t)(t[i + 1].e - t[i + 1].s);
+		for (int j = i + 2; j < nt; j++)
+			if ((size_t)(t[j].e - t[j].s) == L && strncmp(t[j].s, t[i + 1].s, L) == 0) { t[i + 1].del = true; break; }
+	}
+
+	/* 删掉的义项连同后面的分隔符一起去掉；最后一个则去掉前面的分隔符 */
+	size_t len = strlen(meaning);
+	char  *gone = (char *)calloc(len + 1, 1);
+	if (!gone) return false;
+	for (int i = 0; i < nt; i++) {
+		if (!t[i].del) continue;
+		const char *a = t[i].s, *b = (i + 1 < nt) ? t[i + 1].s : t[i].e;
+		if (i + 1 >= nt) {
+			int k = i - 1;
+			while (k >= 0 && t[k].del) k--;
+			a = (k >= 0) ? t[k].e : meaning;
+		}
+		memset(gone + (a - meaning), 1, (size_t)(b - a));
+	}
+	size_t o = 0;
+	for (size_t i = 0; i < len; i++)
+		if (!gone[i]) meaning[o++] = meaning[i];
+	meaning[o] = 0;
+	free(gone);
+
+	/* 开头可能剩下分隔符 */
+	char *p = meaning;
+	for (int k; (k = note_sep(p)) != 0;) p += k;
+	memmove(meaning, p, strlen(p) + 1);
+	return true;
+}
+
 /* 候选词：解析出释义、去重后放进 items */
 static void take(const WordList *wl, Word *items, int *ni, AddStat *st,
                  const char *word, const char *pos_meaning)
 {
 	char pos[DICT_MAX_POS] = {0}, mn[DICT_MAX_MEANING] = {0};
 	split_pos_meaning(pos_meaning, pos, sizeof pos, mn, sizeof mn);
+	strip_notes(mn);
 	if (!mn[0]) { st->bad++; return; }
 	if (exists_in(wl->words, wl->n, word) || exists_in(items, *ni, word)) { st->dup++; return; }
 	put_word(&items[(*ni)++], word, pos, mn);
