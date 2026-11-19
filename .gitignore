@@ -1,11 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
 build/
-*.exe
-*.pdb
-*.ilk
-*.obj
+dist/
+*.tmp
 
-# 本地实际使用的数据文件不入库（仓库里给的是 *.sample.json）
+# 本地实际使用的数据文件不入库（仓库里给的是 samples/*.sample.json）
 dictation_extra.json
 dictation_judge.json
 dictation_settings.json
+dictation_forms.json
+dictation_progress.json
 dictation_progress.bin

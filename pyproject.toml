@@ -1,0 +1,25 @@
+[project]
+name = "xent-dictation"
+version = "2.0.0"
+description = "单词默写 / 变形默写：基于 xenthon（Project-Xent 的 Python 绑定）的 Windows 原生背词工具"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+# xenthon 还没发 PyPI，且需要 0.3.3 之后的几个改动（见 README「依赖」），目前从源码编译
+dependencies = ["xenthon>=0.3.3"]
+
+[project.scripts]
+xent-dictation = "dictation.app:main"
+
+[project.gui-scripts]
+xent-dictationw = "dictation.app:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["dictation"]
+
+[tool.setuptools.package-data]
+dictation = ["forms_words.json"]
