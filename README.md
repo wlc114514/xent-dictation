@@ -2,7 +2,7 @@
 
 Windows 原生背词工具，Python 编写，界面用 [xenthon](https://github.com/Project-Xent/xenthon)（Project-Xent 的 Python 绑定，WinUI 风格控件）。
 
-> 2.0 起整体用 Python 重写，原来的 C23 版本留在标签 [`c-final`](https://github.com/wlc114514/xent-dictation/tree/c-final)。
+> 2.0 起整体用 Python 重写，原来的 C23 版本留在标签 [`c-final`](https://github.com/firnspiegel/xent-dictation/tree/c-final)。
 > C 版的进度文件 dictation_progress.bin 首次启动时会自动转成 dictation_progress.json，原文件保留不动。
 
 ![默写](screenshots/dictation.png)
@@ -44,15 +44,11 @@ Windows 原生背词工具，Python 编写，界面用 [xenthon](https://github.
 
 Windows 10/11、Python 3.12+、xenthon。
 
-xenthon 目前要从源码编译，而且需要几个还没合并到上游的改动：
+xenthon 目前要从源码编译（xmake，见 xenthon 的 README），需要 2026-11-20 之后的 main：
+后台线程 `xtk.post()`、`focus=` 焦点令牌、NavigationView / SelectorBar 的 `items=` 条目都是这之后才合并进去的。
+编好后 `src/xenthon` 下有 `_reconcile.pyd`。
 
-| PR | 内容 |
-|---|---|
-| [xenthon#1](https://github.com/Project-Xent/xenthon/pull/1) / [fluxent#10](https://github.com/Project-Xent/fluxent/pull/10) / [xent-kit#1](https://github.com/Project-Xent/xent-kit/pull/1) | 后台线程 `xtk.post()`、`focus=` 焦点令牌 |
-| [xenthon#2](https://github.com/Project-Xent/xenthon/pull/2) / [xent-kit#2](https://github.com/Project-Xent/xent-kit/pull/2) | NavigationView、SelectorBar 等的条目（`items=`） |
-| [xenthon#3](https://github.com/Project-Xent/xenthon/pull/3) | 两个以上对话框时插入兄弟节点提交失败 |
-
-合并前可以用 [wlc114514/xenthon](https://github.com/wlc114514/xenthon) 的分支编译（xmake，见 xenthon 的 README）。编好后 `src/xenthon` 下有 `_reconcile.pyd`。
+还有一个没合并的小修复 [xenthon#4](https://github.com/Project-Xent/xenthon/pull/4)：不带它的话，用 `DICT_START_PAGE` 直接打开某一页时，左侧导航高亮会停在第一项（页面本身是对的）。
 
 ## 运行
 
